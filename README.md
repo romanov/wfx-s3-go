@@ -1,5 +1,8 @@
 # WFX S3 for Total Commander
 
+<img width="497" height="213" alt="изображение" src="https://github.com/user-attachments/assets/87eb1b2d-de45-48cf-822c-dcf2a07e66d0" />
+
+
 This is an x64-only Total Commander file-system plugin written in Go. It
 exposes S3-compatible buckets as virtual folders and supports browsing,
 uploading, downloading, and deleting objects.
