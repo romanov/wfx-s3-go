@@ -1,0 +1,135 @@
+package s3store
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/example/wfxs3/internal/config"
+)
+
+func TestStoreUsesPathStyleAndS3Operations(t *testing.T) {
+	var uploaded []byte
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if !strings.HasPrefix(request.URL.Path, "/bucket") {
+			http.Error(response, "expected path-style request", http.StatusBadRequest)
+			return
+		}
+		key := strings.TrimPrefix(request.URL.Path, "/bucket/")
+		switch request.Method {
+		case http.MethodGet:
+			if request.URL.Query().Get("list-type") == "2" {
+				response.Header().Set("Content-Type", "application/xml")
+				_, _ = fmt.Fprint(response, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><Prefix>base/</Prefix><KeyCount>3</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated><CommonPrefixes><Prefix>base/docs/</Prefix></CommonPrefixes><Contents><Key>base/empty/</Key><LastModified>2024-01-02T03:04:05Z</LastModified><ETag>"marker"</ETag><Size>0</Size><StorageClass>STANDARD</StorageClass></Contents><Contents><Key>base/readme.txt</Key><LastModified>2024-01-02T03:04:05Z</LastModified><ETag>"etag"</ETag><Size>5</Size><StorageClass>STANDARD</StorageClass></Contents></ListBucketResult>`)
+				return
+			}
+			_, _ = response.Write([]byte("hello"))
+		case http.MethodHead:
+			if key == "missing" {
+				response.WriteHeader(http.StatusNotFound)
+				return
+			}
+			response.Header().Set("Content-Length", "5")
+		case http.MethodPut:
+			var err error
+			uploaded, err = io.ReadAll(request.Body)
+			if err != nil {
+				http.Error(response, err.Error(), http.StatusInternalServerError)
+			}
+		case http.MethodDelete:
+			response.WriteHeader(http.StatusNoContent)
+		default:
+			response.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	profile := config.Profile{
+		Name:      "demo",
+		Endpoint:  server.URL,
+		Region:    "us-east-1",
+		Bucket:    "bucket",
+		Prefix:    "base/",
+		AccessKey: "access",
+		SecretKey: "secret",
+		PathStyle: true,
+	}
+	store := New()
+	entries, err := store.List(context.Background(), profile, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 || entries[0].Name != "docs" || !entries[0].Directory || entries[1].Name != "empty" || !entries[1].Directory || entries[2].Name != "readme.txt" || entries[2].Size != 5 {
+		t.Fatalf("unexpected listing: %+v", entries)
+	}
+
+	exists, err := store.Head(context.Background(), profile, "readme.txt")
+	if err != nil || !exists {
+		t.Fatalf("head failed: %v %v", exists, err)
+	}
+	object, err := store.Download(context.Background(), profile, "readme.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := io.ReadAll(object.Body)
+	_ = object.Body.Close()
+	if err != nil || string(data) != "hello" {
+		t.Fatalf("download failed: %q %v", data, err)
+	}
+	if err := store.Upload(context.Background(), profile, "upload.txt", bytes.NewReader([]byte("uploaded")), 8); err != nil {
+		t.Fatal(err)
+	}
+	if string(uploaded) != "uploaded" {
+		t.Fatalf("unexpected uploaded body: %q", uploaded)
+	}
+	if err := store.Delete(context.Background(), profile, "upload.txt"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStoreDefaultsEmptyRegion(t *testing.T) {
+	var authorization string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		authorization = request.Header.Get("Authorization")
+		response.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	profile := config.Profile{
+		Name:      "demo",
+		Endpoint:  server.URL,
+		Bucket:    "bucket",
+		AccessKey: "access",
+		SecretKey: "secret",
+	}
+
+	exists, err := New().Head(context.Background(), profile, "object.txt")
+	if err != nil || exists {
+		t.Fatalf("expected a not-found result, got %v %v", exists, err)
+	}
+	if !strings.Contains(authorization, "/"+config.DefaultRegion+"/s3/aws4_request") {
+		t.Fatalf("authorization does not use default region %q: %q", config.DefaultRegion, authorization)
+	}
+}
+
+func TestStoreObjectPathEscapesKeys(t *testing.T) {
+	var escapedPath string
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		escapedPath = request.URL.EscapedPath()
+		response.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+	profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "x", Bucket: "bucket", AccessKey: "a", SecretKey: "s", PathStyle: true}
+	exists, err := New().Head(context.Background(), profile, "a b.txt")
+	if err != nil || exists {
+		t.Fatalf("expected a not-found result, got %v %v", exists, err)
+	}
+	if escapedPath != "/bucket/a%20b.txt" {
+		t.Fatalf("unexpected escaped request path: %s", escapedPath)
+	}
+}

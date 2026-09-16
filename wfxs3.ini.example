@@ -1,0 +1,15 @@
+; Copy this file to the directory containing Total Commander's wincmd.ini
+; and rename it to wfxs3.ini.
+;
+; Credentials are intentionally plaintext in this MVP. Protect this file.
+
+[my-server]
+endpoint=https://s3.example.com
+; Optional; defaults to us-east-1. Set a provider-specific signing region when needed.
+; region=us-east-1
+bucket=my-bucket
+prefix=
+access_key=ACCESS_KEY
+secret_key=SECRET_KEY
+session_token=
+path_style=true

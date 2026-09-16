@@ -1,0 +1,32 @@
+# Build output
+/dist/
+/bin/
+/build/
+*.dll
+*.exe
+*.wfx
+*.wfx32
+*.wfx64
+*.wfx64~
+
+# Go caches and local build state
+/.gocache/
+/.gomodcache/
+
+# Test and coverage output
+*.test
+coverage.out
+*.coverprofile
+
+# Local configuration and secrets
+/wfxs3.ini
+/.env
+.env.*
+!.env.example
+
+# Editors and operating-system files
+/.vscode/
+/.idea/
+*.swp
+.DS_Store
+Thumbs.db
