@@ -94,6 +94,7 @@ func pinModule() {
 //export FsInitW
 func FsInitW(pluginNr C.int, progress unsafe.Pointer, log unsafe.Pointer, request unsafe.Pointer) C.int {
 	pinModule()
+	service.ResetConfig()
 	pointers := callbackPointers{
 		pluginNr: uintptr(pluginNr),
 		progress: uintptr(progress),

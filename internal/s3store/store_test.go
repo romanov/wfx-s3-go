@@ -117,6 +117,36 @@ func TestStoreDefaultsEmptyRegion(t *testing.T) {
 	}
 }
 
+func TestStoreClientIdentityIncludesConnectionSettings(t *testing.T) {
+	base := config.Profile{
+		Name:         "demo",
+		Endpoint:     "https://s3.example.test",
+		Region:       "us-east-1",
+		Bucket:       "bucket",
+		AccessKey:    "access",
+		SecretKey:    "secret",
+		SessionToken: "token",
+		PathStyle:    true,
+	}
+	store := New()
+	original := store.client(base)
+
+	variants := []config.Profile{
+		{Name: base.Name, Endpoint: "https://other.example.test", Region: base.Region, Bucket: base.Bucket, AccessKey: base.AccessKey, SecretKey: base.SecretKey, SessionToken: base.SessionToken, PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: "eu-west-1", Bucket: base.Bucket, AccessKey: base.AccessKey, SecretKey: base.SecretKey, SessionToken: base.SessionToken, PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: base.Region, Bucket: "other-bucket", AccessKey: base.AccessKey, SecretKey: base.SecretKey, SessionToken: base.SessionToken, PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: base.Region, Bucket: base.Bucket, AccessKey: "other-access", SecretKey: base.SecretKey, SessionToken: base.SessionToken, PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: base.Region, Bucket: base.Bucket, AccessKey: base.AccessKey, SecretKey: "other-secret", SessionToken: base.SessionToken, PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: base.Region, Bucket: base.Bucket, AccessKey: base.AccessKey, SecretKey: base.SecretKey, SessionToken: "other-token", PathStyle: base.PathStyle},
+		{Name: base.Name, Endpoint: base.Endpoint, Region: base.Region, Bucket: base.Bucket, AccessKey: base.AccessKey, SecretKey: base.SecretKey, SessionToken: base.SessionToken, PathStyle: false},
+	}
+	for _, variant := range variants {
+		if got := store.client(variant); got == original {
+			t.Fatalf("connection settings reused the original client: %+v", variant)
+		}
+	}
+}
+
 func TestStoreObjectPathEscapesKeys(t *testing.T) {
 	var escapedPath string
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {

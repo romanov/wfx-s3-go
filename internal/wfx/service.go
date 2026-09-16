@@ -31,6 +31,7 @@ const (
 	CopyResume            = 2
 	CopyMove              = 4
 	RequestMessageOK      = 8
+	MessageDetails        = 3
 	MessageImportantError = 6
 )
 
@@ -98,6 +99,17 @@ func (s *Service) SetCallbacks(callbacks Callbacks) {
 	s.mu.Unlock()
 }
 
+// ResetConfig discards the parsed configuration and its file stamp. The WFX
+// host can keep the DLL loaded between sessions, so initialization must not
+// rely on a fresh Service value to clear configuration state.
+func (s *Service) ResetConfig() {
+	s.mu.Lock()
+	s.config = config.Config{}
+	s.configInfo = fileStamp{}
+	s.loaded = false
+	s.mu.Unlock()
+}
+
 // SetDefaultIniName converts Total Commander's suggested wincmd.ini path into
 // the plugin-specific settings path recommended by the WFX SDK.
 func (s *Service) SetDefaultIniName(defaultIniName string) {
@@ -107,6 +119,8 @@ func (s *Service) SetDefaultIniName(defaultIniName string) {
 	}
 	s.mu.Lock()
 	s.configPath = filepath.Join(filepath.Dir(defaultIniName), "wfxs3.ini")
+	s.config = config.Config{}
+	s.configInfo = fileStamp{}
 	s.loaded = false
 	s.mu.Unlock()
 }
@@ -118,7 +132,10 @@ func (s *Service) ConfigPath() string {
 }
 
 func (s *Service) FindFirst(remote string) (uint64, FindData, error) {
-	if err := s.reloadConfig(remote == "\\"); err != nil {
+	// Total Commander may enter directly through a saved subdirectory instead
+	// of enumerating the plugin root first. Always reload at this new listing
+	// boundary so that the selected connection reflects the current INI.
+	if err := s.reloadConfig(true); err != nil {
 		return 0, FindData{}, fmt.Errorf("load %s: %w", s.ConfigPath(), err)
 	}
 
@@ -402,6 +419,16 @@ func (s *Service) reloadConfig(force bool) error {
 	s.configInfo = current
 	s.loaded = true
 	s.mu.Unlock()
+
+	callbacks := s.callbacksSnapshot()
+	if callbacks.Log != nil {
+		names := cfg.Names()
+		profiles := "<none>"
+		if len(names) > 0 {
+			profiles = strings.Join(names, ", ")
+		}
+		callbacks.Log(MessageDetails, fmt.Sprintf("loaded %s; profiles: %s", filename, profiles))
+	}
 	return nil
 }
 

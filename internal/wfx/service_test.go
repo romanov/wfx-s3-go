@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,6 +78,132 @@ func newTestService(t *testing.T, backend *fakeBackend) config.Profile {
 	service := New(backend)
 	service.SetDefaultIniName(ini)
 	return config.Profile{Name: "demo", Endpoint: "https://s3.example.test", Region: "us-east-1", Bucket: "bucket", AccessKey: "access", SecretKey: "secret", PathStyle: true}
+}
+
+func writeServiceConfig(t *testing.T, service *Service, contents string) {
+	t.Helper()
+	if err := os.WriteFile(service.ConfigPath(), []byte(contents), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func profileConfig(name, endpoint string) string {
+	return "[" + name + "]\nendpoint=" + endpoint + "\nregion=us-east-1\nbucket=bucket\naccess_key=access\nsecret_key=secret\n"
+}
+
+func findNames(t *testing.T, service *Service, remote string) []string {
+	t.Helper()
+	token, first, err := service.FindFirst(remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.FindClose(token)
+
+	names := []string{first.Name}
+	for {
+		entry, ok, err := service.FindNext(token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			return names
+		}
+		names = append(names, entry.Name)
+	}
+}
+
+func TestFindFirstReloadsConfigDespiteUnchangedStamp(t *testing.T) {
+	service := New(newFakeBackend())
+	service.SetDefaultIniName(filepath.Join(t.TempDir(), "wincmd.ini"))
+	initial := profileConfig("old", "https://s3.example.test")
+	replacement := profileConfig("new", "https://s3.example.test")
+	if len(initial) != len(replacement) {
+		t.Fatalf("test configs must have equal sizes: %d != %d", len(initial), len(replacement))
+	}
+	writeServiceConfig(t, service, initial)
+	before, err := os.Stat(service.ConfigPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if names := findNames(t, service, `\`); len(names) != 1 || names[0] != "old" {
+		t.Fatalf("unexpected initial profiles: %v", names)
+	}
+	writeServiceConfig(t, service, replacement)
+	if err := os.Chtimes(service.ConfigPath(), before.ModTime(), before.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	if names := findNames(t, service, `\`); len(names) != 1 || names[0] != "new" {
+		t.Fatalf("configuration was not reloaded: %v", names)
+	}
+}
+
+func TestFindFirstReloadsConfigForSavedSubdirectory(t *testing.T) {
+	backend := newFakeBackend()
+	service := New(backend)
+	service.SetDefaultIniName(filepath.Join(t.TempDir(), "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("old", "https://s3.example.test"))
+	backend.entries["old|"] = []s3store.Entry{{Name: "old.txt"}}
+	backend.entries["new|"] = []s3store.Entry{{Name: "new.txt"}}
+
+	token, _, err := service.FindFirst(`\old`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.FindClose(token)
+	writeServiceConfig(t, service, profileConfig("new", "https://s3.example.test"))
+	if _, _, err := service.FindFirst(`\old`); err == nil {
+		t.Fatal("removed profile was still available after configuration reload")
+	}
+	token, first, err := service.FindFirst(`\new`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service.FindClose(token)
+	if first.Name != "new.txt" {
+		t.Fatalf("unexpected new profile entry: %+v", first)
+	}
+}
+
+func TestConfigUsesTotalCommanderSettingsDirectory(t *testing.T) {
+	settingsDir := t.TempDir()
+	pluginDir := t.TempDir()
+	service := New(newFakeBackend())
+	service.SetDefaultIniName(filepath.Join(settingsDir, "wincmd.ini"))
+	if err := os.WriteFile(filepath.Join(pluginDir, "wfxs3.ini"), []byte(profileConfig("old", "https://s3.example.test")), 0600); err != nil {
+		t.Fatal(err)
+	}
+	writeServiceConfig(t, service, profileConfig("current", "https://s3.example.test"))
+
+	if got, want := service.ConfigPath(), filepath.Join(settingsDir, "wfxs3.ini"); got != want {
+		t.Fatalf("unexpected config path: got %q, want %q", got, want)
+	}
+	if names := findNames(t, service, `\`); len(names) != 1 || names[0] != "current" {
+		t.Fatalf("loaded profiles from the wrong directory: %v", names)
+	}
+}
+
+func TestConfigLoadLogsPathAndProfilesWithoutSecrets(t *testing.T) {
+	service := New(newFakeBackend())
+	service.SetDefaultIniName(filepath.Join(t.TempDir(), "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+	var messageType int
+	var message string
+	service.SetCallbacks(Callbacks{Log: func(gotType int, gotMessage string) {
+		messageType = gotType
+		message = gotMessage
+	}})
+
+	_ = findNames(t, service, `\`)
+	if messageType != MessageDetails {
+		t.Fatalf("unexpected config log type: %d", messageType)
+	}
+	if !strings.Contains(message, service.ConfigPath()) || !strings.Contains(message, "demo") {
+		t.Fatalf("config log omitted path or profile: %q", message)
+	}
+	if strings.Contains(message, "secret") || strings.Contains(message, "access") {
+		t.Fatalf("config log exposed credentials: %q", message)
+	}
 }
 
 func TestFindFirstAndNext(t *testing.T) {
