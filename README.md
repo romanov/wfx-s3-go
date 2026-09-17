@@ -1,6 +1,7 @@
 # WFX S3 for Total Commander
 
-<img width="1774" height="887" alt="total commander s3 aws" src="https://github.com/user-attachments/assets/05c930c4-32f1-43f9-b83c-0093c59455b8" />
+<img width="650" height="325" alt="653090478-05c930c4-32f1-43f9-b83c-0093c59455b8(1)" src="https://github.com/user-attachments/assets/aedca9ba-1624-4fa1-bb86-946f9a9eff8c" />
+
 
 This is an x64-only Total Commander file-system plugin written in Go. It
 exposes S3-compatible buckets as virtual folders and supports browsing,
