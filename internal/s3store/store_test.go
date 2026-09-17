@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
+
 	"github.com/example/wfxs3/internal/config"
 )
 
@@ -161,5 +163,19 @@ func TestStoreObjectPathEscapesKeys(t *testing.T) {
 	}
 	if escapedPath != "/bucket/a%20b.txt" {
 		t.Fatalf("unexpected escaped request path: %s", escapedPath)
+	}
+}
+
+func TestStoreHTTPClientAppliesTimeouts(t *testing.T) {
+	store := New()
+	client, ok := store.httpClient.(*awshttp.BuildableClient)
+	if !ok {
+		t.Fatalf("expected a buildable HTTP client, got %T", store.httpClient)
+	}
+	if got := client.GetDialer().Timeout; got != dialTimeout {
+		t.Errorf("dial timeout = %s, want %s", got, dialTimeout)
+	}
+	if got := client.GetTransport().ResponseHeaderTimeout; got != responseHeaderTimeout {
+		t.Errorf("response header timeout = %s, want %s", got, responseHeaderTimeout)
 	}
 }

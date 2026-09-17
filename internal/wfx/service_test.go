@@ -3,7 +3,10 @@ package wfx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -304,5 +307,111 @@ func TestPutFileReportsCompletionForEmptyFile(t *testing.T) {
 	}
 	if len(percents) < 2 || percents[len(percents)-1] != 100 {
 		t.Fatalf("expected a 100%% completion callback, got %v", percents)
+	}
+}
+
+// TestPutFileUploadsThroughPlainHTTPEndpoint covers a regression: the upload
+// body was wrapped in a reader that exposed only io.Reader, which hid the
+// underlying file's io.Seeker. For an http:// endpoint the AWS SDK signs the
+// real payload hash, so it reads the body and then rewinds it, and every upload
+// failed with "failed to compute payload hash: ... request stream is not
+// seekable". https:// endpoints use UNSIGNED-PAYLOAD and never noticed.
+func TestPutFileUploadsThroughPlainHTTPEndpoint(t *testing.T) {
+	payload := []byte(strings.Repeat("s3 over plain http\n", 512))
+	var uploaded []byte
+	puts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodHead:
+			response.WriteHeader(http.StatusNotFound)
+		case http.MethodPut:
+			puts++
+			body, err := io.ReadAll(request.Body)
+			if err != nil {
+				http.Error(response, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			uploaded = body
+		default:
+			response.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	dir := t.TempDir()
+	service := New(s3store.New())
+	service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", server.URL))
+
+	local := filepath.Join(dir, "payload.txt")
+	if err := os.WriteFile(local, payload, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var percents []int
+	service.SetCallbacks(Callbacks{Progress: func(_, _ string, percent int) bool {
+		percents = append(percents, percent)
+		return false
+	}})
+
+	status, err := service.PutFile(local, `\demo\payload.txt`, 0)
+	if err != nil || status != FileOK {
+		t.Fatalf("upload failed: %d %v", status, err)
+	}
+	if !bytes.Equal(uploaded, payload) {
+		t.Fatalf("uploaded %d bytes, want %d", len(uploaded), len(payload))
+	}
+	if puts != 1 {
+		t.Fatalf("expected exactly one PutObject request, got %d", puts)
+	}
+	if len(percents) == 0 || percents[len(percents)-1] != 100 {
+		t.Fatalf("expected a 100%% completion callback, got %v", percents)
+	}
+}
+
+func TestProgressRewindReanchorsReporting(t *testing.T) {
+	var percents []int
+	progress := newProgress(Callbacks{Progress: func(_, _ string, percent int) bool {
+		percents = append(percents, percent)
+		return false
+	}}, "source", "target", 100)
+
+	// The SDK drains the body to hash it, rewinds, then streams it for real.
+	progress.update(progress.done + 100)
+	progress.rewind(0)
+	progress.update(progress.done + 50)
+
+	if len(percents) == 0 || percents[len(percents)-1] != 50 {
+		t.Fatalf("expected progress to resume at 50%% after the rewind, got %v", percents)
+	}
+}
+
+func TestFindFirstFailsWhenEndpointStopsResponding(t *testing.T) {
+	previous := metadataTimeout
+	metadataTimeout = 2 * time.Second
+	t.Cleanup(func() { metadataTimeout = previous })
+
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-release
+	}))
+	defer server.Close()
+	defer close(release)
+
+	service := New(s3store.New())
+	service.SetDefaultIniName(filepath.Join(t.TempDir(), "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", server.URL))
+
+	start := time.Now()
+	_, _, err := service.FindFirst(`\demo`)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected the listing to fail while the endpoint withheld its response")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected a deadline error, got %v", err)
+	}
+	if elapsed > 30*time.Second {
+		t.Fatalf("listing blocked for %s despite the metadata timeout", elapsed)
 	}
 }

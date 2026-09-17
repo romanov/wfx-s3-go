@@ -5,11 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -43,16 +46,44 @@ type Backend interface {
 	Delete(context.Context, config.Profile, string) error
 }
 
+const (
+	// dialTimeout bounds how long a wrong or unreachable endpoint can stall
+	// before the plugin reports a failure.
+	dialTimeout = 15 * time.Second
+	// responseHeaderTimeout bounds the wait for response headers, which begins
+	// only once the request body has been written. Transfers of any size are
+	// therefore unaffected, while a server that accepts a connection and never
+	// answers still fails promptly.
+	responseHeaderTimeout = 30 * time.Second
+)
+
+// newHTTPClient builds the transport shared by every profile. The SDK's default
+// client has no response-header timeout, so a silent endpoint would otherwise
+// hang Total Commander indefinitely.
+func newHTTPClient() aws.HTTPClient {
+	return awshttp.NewBuildableClient().
+		WithDialerOptions(func(dialer *net.Dialer) {
+			dialer.Timeout = dialTimeout
+		}).
+		WithTransportOptions(func(transport *http.Transport) {
+			transport.ResponseHeaderTimeout = responseHeaderTimeout
+		})
+}
+
 // Store is an AWS SDK-backed Backend. Clients are cached by profile identity
 // so HTTP connections can be reused while configuration changes invalidate the
 // relevant key naturally.
 type Store struct {
-	mu      sync.Mutex
-	clients map[string]*s3.Client
+	mu         sync.Mutex
+	clients    map[string]*s3.Client
+	httpClient aws.HTTPClient
 }
 
 func New() *Store {
-	return &Store{clients: make(map[string]*s3.Client)}
+	return &Store{
+		clients:    make(map[string]*s3.Client),
+		httpClient: newHTTPClient(),
+	}
 }
 
 func (s *Store) client(profile config.Profile) *s3.Client {
@@ -69,6 +100,7 @@ func (s *Store) client(profile config.Profile) *s3.Client {
 	awsConfig := aws.Config{
 		Region:      region,
 		Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider(profile.AccessKey, profile.SecretKey, profile.SessionToken)),
+		HTTPClient:  s.httpClient,
 	}
 	client := s3.NewFromConfig(awsConfig, func(options *s3.Options) {
 		options.BaseEndpoint = aws.String(profile.Endpoint)
@@ -186,7 +218,7 @@ func (s *Store) Delete(ctx context.Context, profile config.Profile, key string) 
 }
 
 func isNotFound(err error) bool {
-	if errors.Is(err, context.Canceled) {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
 	var statusError interface{ HTTPStatusCode() int }

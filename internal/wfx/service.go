@@ -41,6 +41,26 @@ var (
 	ErrUserAbort      = errors.New("transfer cancelled by user")
 )
 
+// metadataTimeout bounds listing, existence, and delete calls. Total Commander
+// runs these on its user-interface thread, so an endpoint that accepts a
+// connection and then goes silent must not block the file manager forever.
+// Transfers deliberately have no deadline of their own: a large file may
+// legitimately take hours, and the transport's response-header timeout already
+// catches a server that stops answering. It is a variable so that tests can
+// shorten it.
+var metadataTimeout = 60 * time.Second
+
+// metadataContext bounds a short control-plane call.
+func metadataContext() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), metadataTimeout)
+}
+
+// transferContext scopes a download or upload to its own call so that the
+// request and its streamed body are released when the transfer returns.
+func transferContext() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
+
 // Callbacks contains the already-adapted Total Commander callbacks. The
 // service layer remains independent from cgo and is therefore straightforward
 // to test.
@@ -157,7 +177,9 @@ func (s *Service) FindFirst(remote string) (uint64, FindData, error) {
 	if !ok {
 		return 0, FindData{}, fmt.Errorf("profile %q is not configured", profileName)
 	}
-	entries, err := s.backend.List(context.Background(), profile, relative)
+	listCtx, cancelList := metadataContext()
+	defer cancelList()
+	entries, err := s.backend.List(listCtx, profile, relative)
 	if err != nil {
 		return 0, FindData{}, fmt.Errorf("list %s: %w", remote, err)
 	}
@@ -236,7 +258,9 @@ func (s *Service) GetFile(remote, local string, flags int) (int, error) {
 		return FileExists, nil
 	}
 
-	object, err := s.backend.Download(context.Background(), profile, key)
+	downloadCtx, cancelDownload := transferContext()
+	defer cancelDownload()
+	object, err := s.backend.Download(downloadCtx, profile, key)
 	if err != nil {
 		return FileNotFound, fmt.Errorf("download %s: %w", remote, err)
 	}
@@ -291,7 +315,9 @@ func (s *Service) GetFile(remote, local string, flags int) (int, error) {
 	removeTemp = false
 
 	if flags&CopyMove != 0 {
-		if err := s.backend.Delete(context.Background(), profile, key); err != nil {
+		deleteCtx, cancelDelete := metadataContext()
+		defer cancelDelete()
+		if err := s.backend.Delete(deleteCtx, profile, key); err != nil {
 			return FileReadError, fmt.Errorf("delete after download %s: %w", remote, err)
 		}
 	}
@@ -317,7 +343,9 @@ func (s *Service) PutFile(local, remote string, flags int) (int, error) {
 		return FileReadError, fmt.Errorf("local path is a directory: %s", local)
 	}
 
-	exists, err := s.backend.Head(context.Background(), profile, key)
+	headCtx, cancelHead := metadataContext()
+	defer cancelHead()
+	exists, err := s.backend.Head(headCtx, profile, key)
 	if err != nil {
 		return FileWriteError, fmt.Errorf("check remote %s: %w", remote, err)
 	}
@@ -336,7 +364,9 @@ func (s *Service) PutFile(local, remote string, flags int) (int, error) {
 		return FileUserAbort, ErrUserAbort
 	}
 	reader := &progressReader{reader: file, progress: progress}
-	uploadErr := s.backend.Upload(context.Background(), profile, key, reader, info.Size())
+	uploadCtx, cancelUpload := transferContext()
+	defer cancelUpload()
+	uploadErr := s.backend.Upload(uploadCtx, profile, key, reader, info.Size())
 	if uploadErr != nil {
 		if errors.Is(uploadErr, ErrUserAbort) {
 			return FileUserAbort, ErrUserAbort
@@ -362,7 +392,9 @@ func (s *Service) DeleteFile(remote string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if err := s.backend.Delete(context.Background(), profile, key); err != nil {
+	deleteCtx, cancelDelete := metadataContext()
+	defer cancelDelete()
+	if err := s.backend.Delete(deleteCtx, profile, key); err != nil {
 		return false, fmt.Errorf("delete %s: %w", remote, err)
 	}
 	return true, nil
@@ -486,6 +518,14 @@ func (p *progress) update(done int64) bool {
 	return p.report(done, false)
 }
 
+// rewind re-anchors the byte counter after the source was replayed so that the
+// next report reflects the resumed position instead of the abandoned one.
+func (p *progress) rewind(done int64) {
+	p.done = done
+	p.lastPct = -1
+	p.last = time.Time{}
+}
+
 func (p *progress) finish() bool {
 	p.done = p.total
 	return p.report(p.total, true)
@@ -533,7 +573,7 @@ func (w *progressWriter) Write(data []byte) (int, error) {
 }
 
 type progressReader struct {
-	reader   io.Reader
+	reader   io.ReadSeeker
 	progress *progress
 	readErr  error
 }
@@ -547,4 +587,19 @@ func (r *progressReader) Read(data []byte) (int, error) {
 		r.readErr = err
 	}
 	return n, err
+}
+
+// Seek keeps the upload body rewindable. The AWS SDK replays the body to
+// compute the SigV4 payload hash for plain-HTTP endpoints, and again before
+// every retry; a reader that only satisfies io.Reader fails both with
+// "request stream is not seekable". Re-anchoring the progress accounting here
+// keeps a replayed body from being reported as additional transferred bytes.
+func (r *progressReader) Seek(offset int64, whence int) (int64, error) {
+	position, err := r.reader.Seek(offset, whence)
+	if err != nil {
+		return position, err
+	}
+	r.readErr = nil
+	r.progress.rewind(position)
+	return position, nil
 }
