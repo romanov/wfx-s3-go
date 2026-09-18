@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -37,7 +38,8 @@ type Object struct {
 	LastModified time.Time
 }
 
-// Backend is the small S3 surface used by the WFX layer and tests.
+// Backend is the small S3 surface used by the WFX layer and tests. Download
+// returns an error wrapping os.ErrNotExist when the object does not exist.
 type Backend interface {
 	List(context.Context, config.Profile, string) ([]Entry, error)
 	Head(context.Context, config.Profile, string) (bool, error)
@@ -190,6 +192,9 @@ func (s *Store) Download(ctx context.Context, profile config.Profile, key string
 		Key:    aws.String(path.ObjectKey(profile, key)),
 	})
 	if err != nil {
+		if isNotFound(err) {
+			return Object{}, fmt.Errorf("%w: %w", os.ErrNotExist, err)
+		}
 		return Object{}, err
 	}
 	object := Object{Body: output.Body, Size: aws.ToInt64(output.ContentLength)}

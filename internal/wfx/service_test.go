@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,10 +22,11 @@ import (
 )
 
 type fakeBackend struct {
-	entries map[string][]s3store.Entry
-	objects map[string][]byte
-	deleted []string
-	uploads map[string][]byte
+	entries     map[string][]s3store.Entry
+	objects     map[string][]byte
+	deleted     []string
+	uploads     map[string][]byte
+	downloadErr error
 }
 
 func newFakeBackend() *fakeBackend {
@@ -46,6 +51,9 @@ func (f *fakeBackend) Head(_ context.Context, profile config.Profile, key string
 }
 
 func (f *fakeBackend) Download(_ context.Context, profile config.Profile, key string) (s3store.Object, error) {
+	if f.downloadErr != nil {
+		return s3store.Object{}, f.downloadErr
+	}
 	data, ok := f.objects[objectID(profile, key)]
 	if !ok {
 		return s3store.Object{}, os.ErrNotExist
@@ -369,20 +377,22 @@ func TestPutFileUploadsThroughPlainHTTPEndpoint(t *testing.T) {
 	}
 }
 
-func TestProgressRewindReanchorsReporting(t *testing.T) {
-	var percents []int
-	progress := newProgress(Callbacks{Progress: func(_, _ string, percent int) bool {
-		percents = append(percents, percent)
-		return false
-	}}, "source", "target", 100)
+func TestCountingReaderTracksReplays(t *testing.T) {
+	var done atomic.Int64
+	reader := &countingReader{reader: bytes.NewReader(make([]byte, 100)), done: &done}
 
 	// The SDK drains the body to hash it, rewinds, then streams it for real.
-	progress.update(progress.done + 100)
-	progress.rewind(0)
-	progress.update(progress.done + 50)
-
-	if len(percents) == 0 || percents[len(percents)-1] != 50 {
-		t.Fatalf("expected progress to resume at 50%% after the rewind, got %v", percents)
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.CopyN(io.Discard, reader, 50); err != nil {
+		t.Fatal(err)
+	}
+	if got := done.Load(); got != 50 {
+		t.Fatalf("expected the replayed body to count 50 bytes, got %d", got)
 	}
 }
 
@@ -413,5 +423,244 @@ func TestFindFirstFailsWhenEndpointStopsResponding(t *testing.T) {
 	}
 	if elapsed > 30*time.Second {
 		t.Fatalf("listing blocked for %s despite the metadata timeout", elapsed)
+	}
+}
+
+func newHTTPService(t *testing.T, endpoint string) (*Service, string) {
+	t.Helper()
+	dir := t.TempDir()
+	service := New(s3store.New())
+	service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", endpoint))
+	return service, dir
+}
+
+func setTransferTimings(t *testing.T, idle, interval time.Duration) {
+	t.Helper()
+	previousIdle, previousInterval := transferIdleTimeout, progressInterval
+	transferIdleTimeout, progressInterval = idle, interval
+	t.Cleanup(func() { transferIdleTimeout, progressInterval = previousIdle, previousInterval })
+}
+
+// stallingDownloadServer answers every GET with headers and the first 64 KiB
+// of a 1 MiB body, then goes silent. stalled is closed once a response has
+// stopped sending.
+func stallingDownloadServer(t *testing.T) (*httptest.Server, <-chan struct{}) {
+	t.Helper()
+	release := make(chan struct{})
+	stalled := make(chan struct{})
+	var once sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Length", strconv.Itoa(1<<20))
+		response.WriteHeader(http.StatusOK)
+		_, _ = response.Write(make([]byte, 64<<10))
+		response.(http.Flusher).Flush()
+		once.Do(func() { close(stalled) })
+		<-release
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	return server, stalled
+}
+
+// A body that stops arriving used to block GetFile, and with it Total
+// Commander, forever: nothing bounded the read once the headers had arrived.
+func TestGetFileStallFailsAfterIdleTimeout(t *testing.T) {
+	setTransferTimings(t, time.Second, 10*time.Millisecond)
+	server, _ := stallingDownloadServer(t)
+	service, dir := newHTTPService(t, server.URL)
+	local := filepath.Join(dir, "stalled.bin")
+
+	start := time.Now()
+	status, err := service.GetFile(`\demo\stalled.bin`, local, 0)
+	if status != FileReadError || !errors.Is(err, ErrTransferStalled) {
+		t.Fatalf("expected a stalled download, got %d %v", status, err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("stalled download took %s to fail", elapsed)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".wfxs3-download-*")); len(leftovers) != 0 {
+		t.Fatalf("temporary download files were left behind: %v", leftovers)
+	}
+	if _, err := os.Stat(local); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a partial download was kept: %v", err)
+	}
+}
+
+// Cancel must work while the network is stalled, which requires consulting
+// the progress callback even when no bytes arrive.
+func TestGetFileCancelDuringStall(t *testing.T) {
+	setTransferTimings(t, time.Minute, 10*time.Millisecond)
+	server, stalled := stallingDownloadServer(t)
+	service, dir := newHTTPService(t, server.URL)
+	var cancelledAt atomic.Int64
+	go func() {
+		select {
+		case <-stalled:
+			time.Sleep(500 * time.Millisecond)
+			cancelledAt.Store(time.Now().UnixNano())
+		case <-time.After(10 * time.Second):
+		}
+	}()
+	service.SetCallbacks(Callbacks{Progress: func(_, _ string, _ int) bool {
+		return cancelledAt.Load() != 0 // the user has clicked Cancel
+	}})
+
+	status, err := service.GetFile(`\demo\stalled.bin`, filepath.Join(dir, "stalled.bin"), 0)
+	if status != FileUserAbort || !errors.Is(err, ErrUserAbort) {
+		t.Fatalf("expected a user abort, got %d %v", status, err)
+	}
+	if latency := time.Since(time.Unix(0, cancelledAt.Load())); latency > 2*time.Second {
+		t.Fatalf("Cancel took %s to take effect during the stall", latency)
+	}
+}
+
+// Cancel during an upload used to surface as a failed read of the request
+// body. The AWS SDK retries those as connection errors, rewinding the file and
+// sending it again, so an upload the user had cancelled could still complete.
+func TestPutFileCancelIsNotRetried(t *testing.T) {
+	setTransferTimings(t, time.Minute, 10*time.Millisecond)
+	streaming := make(chan struct{})
+	release := make(chan struct{})
+	var puts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		switch request.Method {
+		case http.MethodHead:
+			response.WriteHeader(http.StatusNotFound)
+		case http.MethodPut:
+			if puts.Add(1) == 1 {
+				_, _ = io.CopyN(io.Discard, request.Body, 1<<20)
+				close(streaming)
+				<-release
+				return
+			}
+			// A retried upload would complete here.
+			_, _ = io.Copy(io.Discard, request.Body)
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	service, dir := newHTTPService(t, server.URL)
+	local := filepath.Join(dir, "large.bin")
+	if err := os.WriteFile(local, make([]byte, 32<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var cancelled atomic.Bool
+	service.SetCallbacks(Callbacks{Progress: func(_, _ string, _ int) bool {
+		select {
+		case <-streaming:
+			// Report Cancel only once, as a host that does not repeat it would.
+			return cancelled.CompareAndSwap(false, true)
+		default:
+			return false
+		}
+	}})
+
+	start := time.Now()
+	status, err := service.PutFile(local, `\demo\large.bin`, 0)
+	if status != FileUserAbort || !errors.Is(err, ErrUserAbort) {
+		t.Fatalf("expected a user abort, got %d %v", status, err)
+	}
+	if got := puts.Load(); got != 1 {
+		t.Fatalf("the cancelled upload was sent %d times", got)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Cancel took %s", elapsed)
+	}
+}
+
+func TestPutFileStallFailsAfterIdleTimeout(t *testing.T) {
+	setTransferTimings(t, time.Second, 10*time.Millisecond)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodHead {
+			response.WriteHeader(http.StatusNotFound)
+			return
+		}
+		<-release // accept the upload but never read its body or answer
+	}))
+	t.Cleanup(func() {
+		close(release)
+		server.Close()
+	})
+	service, dir := newHTTPService(t, server.URL)
+	local := filepath.Join(dir, "large.bin")
+	if err := os.WriteFile(local, make([]byte, 8<<20), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := service.PutFile(local, `\demo\large.bin`, 0)
+	if status != FileWriteError || !errors.Is(err, ErrTransferStalled) {
+		t.Fatalf("expected a stalled upload, got %d %v", status, err)
+	}
+}
+
+func TestGetFileOverwrite(t *testing.T) {
+	tests := []struct {
+		name     string
+		flags    int
+		readOnly bool
+		status   int
+		content  string
+	}{
+		{name: "existing file without overwrite", status: FileExists, content: "old"},
+		{name: "overwrite", flags: CopyOverwrite, status: FileOK, content: "hello"},
+		{name: "overwrite read-only file", flags: CopyOverwrite, readOnly: true, status: FileOK, content: "hello"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.objects[objectID(config.Profile{Name: "demo"}, "hello.txt")] = []byte("hello")
+			dir := t.TempDir()
+			service := New(backend)
+			service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+			writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+			local := filepath.Join(dir, "hello.txt")
+			mode := os.FileMode(0o600)
+			if test.readOnly {
+				mode = 0o400
+			}
+			if err := os.WriteFile(local, []byte("old"), mode); err != nil {
+				t.Fatal(err)
+			}
+
+			status, err := service.GetFile(`\demo\hello.txt`, local, test.flags)
+			if err != nil || status != test.status {
+				t.Fatalf("unexpected result: %d %v", status, err)
+			}
+			if data, err := os.ReadFile(local); err != nil || string(data) != test.content {
+				t.Fatalf("local file holds %q (%v), want %q", data, err, test.content)
+			}
+		})
+	}
+}
+
+func TestGetFileMapsDownloadErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		status int
+	}{
+		{name: "missing object", err: fmt.Errorf("%w: NoSuchKey", os.ErrNotExist), status: FileNotFound},
+		{name: "access denied", err: errors.New("api error AccessDenied: Access Denied"), status: FileReadError},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.downloadErr = test.err
+			dir := t.TempDir()
+			service := New(backend)
+			service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+			writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+
+			status, err := service.GetFile(`\demo\file.txt`, filepath.Join(dir, "file.txt"), 0)
+			if status != test.status || !errors.Is(err, test.err) {
+				t.Fatalf("got %d %v, want status %d", status, err, test.status)
+			}
+		})
 	}
 }

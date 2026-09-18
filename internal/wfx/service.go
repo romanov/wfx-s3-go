@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/wfxs3/internal/config"
@@ -36,29 +37,34 @@ const (
 )
 
 var (
-	ErrEmptyDirectory = errors.New("directory is empty")
-	ErrInvalidHandle  = errors.New("invalid find handle")
-	ErrUserAbort      = errors.New("transfer cancelled by user")
+	ErrEmptyDirectory  = errors.New("directory is empty")
+	ErrInvalidHandle   = errors.New("invalid find handle")
+	ErrUserAbort       = errors.New("transfer cancelled by user")
+	ErrTransferStalled = errors.New("transfer stalled")
 )
 
 // metadataTimeout bounds listing, existence, and delete calls. Total Commander
 // runs these on its user-interface thread, so an endpoint that accepts a
 // connection and then goes silent must not block the file manager forever.
-// Transfers deliberately have no deadline of their own: a large file may
-// legitimately take hours, and the transport's response-header timeout already
-// catches a server that stops answering. It is a variable so that tests can
-// shorten it.
+// It is a variable so that tests can shorten it.
 var metadataTimeout = 60 * time.Second
+
+// Transfers have no overall deadline because a large file may legitimately
+// take hours. The transport's response-header timeout only covers the wait for
+// a response, not a body that stops moving, so runTransfer fails a transfer
+// once no bytes have moved for transferIdleTimeout. It is longer than the
+// response-header timeout, which leaves a server that is slow to answer after
+// an upload to that timeout and the SDK's retries. progressInterval is how
+// often runTransfer samples a transfer and offers Total Commander a progress
+// update. Both are variables so that tests can shorten them.
+var (
+	transferIdleTimeout = 60 * time.Second
+	progressInterval    = 100 * time.Millisecond
+)
 
 // metadataContext bounds a short control-plane call.
 func metadataContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), metadataTimeout)
-}
-
-// transferContext scopes a download or upload to its own call so that the
-// request and its streamed body are released when the transfer returns.
-func transferContext() (context.Context, context.CancelFunc) {
-	return context.WithCancel(context.Background())
 }
 
 // Callbacks contains the already-adapted Total Commander callbacks. The
@@ -258,17 +264,6 @@ func (s *Service) GetFile(remote, local string, flags int) (int, error) {
 		return FileExists, nil
 	}
 
-	downloadCtx, cancelDownload := transferContext()
-	defer cancelDownload()
-	object, err := s.backend.Download(downloadCtx, profile, key)
-	if err != nil {
-		return FileNotFound, fmt.Errorf("download %s: %w", remote, err)
-	}
-	if object.Body == nil {
-		return FileReadError, fmt.Errorf("download %s returned an empty body", remote)
-	}
-	defer object.Body.Close()
-
 	temp, err := os.CreateTemp(filepath.Dir(local), ".wfxs3-download-*")
 	if err != nil {
 		return FileWriteError, err
@@ -282,34 +277,44 @@ func (s *Service) GetFile(remote, local string, flags int) (int, error) {
 		}
 	}()
 
-	progress := newProgress(s.callbacksSnapshot(), remote, local, object.Size)
+	progress := newProgress(s.callbacksSnapshot(), remote, local, 0)
 	if progress.start() {
 		return FileUserAbort, ErrUserAbort
 	}
-	writer := &progressWriter{writer: temp, progress: progress}
-	_, copyErr := io.CopyBuffer(writer, object.Body, make([]byte, 1024*1024))
-	if closeErr := temp.Close(); closeErr != nil && copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		if errors.Is(copyErr, ErrUserAbort) {
-			return FileUserAbort, ErrUserAbort
+	var done, total atomic.Int64
+	writer := &countingWriter{writer: temp, done: &done}
+	err = runTransfer(progress, &done, &total, func(ctx context.Context) error {
+		object, err := s.backend.Download(ctx, profile, key)
+		if err != nil {
+			return err
 		}
-		if writer.writeErr != nil {
-			return FileWriteError, writer.writeErr
+		if object.Body == nil {
+			return errors.New("the response has no body")
 		}
-		return FileReadError, copyErr
+		defer object.Body.Close()
+		total.Store(object.Size)
+		_, err = io.CopyBuffer(writer, object.Body, make([]byte, 1024*1024))
+		return err
+	})
+	switch {
+	case errors.Is(err, ErrUserAbort):
+		return FileUserAbort, ErrUserAbort
+	case writer.err != nil:
+		return FileWriteError, writer.err
+	case errors.Is(err, os.ErrNotExist):
+		return FileNotFound, fmt.Errorf("download %s: %w", remote, err)
+	case err != nil:
+		return FileReadError, fmt.Errorf("download %s: %w", remote, err)
 	}
+	if err := temp.Close(); err != nil {
+		return FileWriteError, err
+	}
+	progress.total = total.Load()
 	if progress.finish() {
 		return FileUserAbort, ErrUserAbort
 	}
 
-	if exists {
-		if err := os.Remove(local); err != nil {
-			return FileWriteError, err
-		}
-	}
-	if err := os.Rename(tempName, local); err != nil {
+	if err := replaceFile(tempName, local); err != nil {
 		return FileWriteError, err
 	}
 	removeTemp = false
@@ -363,18 +368,20 @@ func (s *Service) PutFile(local, remote string, flags int) (int, error) {
 	if progress.start() {
 		return FileUserAbort, ErrUserAbort
 	}
-	reader := &progressReader{reader: file, progress: progress}
-	uploadCtx, cancelUpload := transferContext()
-	defer cancelUpload()
-	uploadErr := s.backend.Upload(uploadCtx, profile, key, reader, info.Size())
-	if uploadErr != nil {
-		if errors.Is(uploadErr, ErrUserAbort) {
+	var done, total atomic.Int64
+	total.Store(info.Size())
+	reader := &countingReader{reader: file, done: &done}
+	err = runTransfer(progress, &done, &total, func(ctx context.Context) error {
+		return s.backend.Upload(ctx, profile, key, reader, info.Size())
+	})
+	if err != nil {
+		if errors.Is(err, ErrUserAbort) {
 			return FileUserAbort, ErrUserAbort
 		}
-		if reader.readErr != nil {
-			return FileReadError, reader.readErr
+		if readErr := reader.readError(); readErr != nil {
+			return FileReadError, readErr
 		}
-		return FileWriteError, fmt.Errorf("upload %s: %w", remote, uploadErr)
+		return FileWriteError, fmt.Errorf("upload %s: %w", remote, err)
 	}
 	if progress.finish() {
 		return FileUserAbort, ErrUserAbort
@@ -495,6 +502,66 @@ func localState(filename string) (exists, isDir bool, err error) {
 	return true, info.IsDir(), nil
 }
 
+// replaceFile moves source over target. os.Rename replaces an existing target
+// in a single MoveFileEx call, so a failed rename leaves the old file intact.
+// MoveFileEx refuses to replace a read-only file; the caller has already
+// confirmed the overwrite, so clear the attribute and try once more.
+func replaceFile(source, target string) error {
+	err := os.Rename(source, target)
+	if err == nil {
+		return nil
+	}
+	info, statErr := os.Stat(target)
+	if statErr != nil || info.Mode().Perm()&0o200 != 0 {
+		return err
+	}
+	if os.Chmod(target, 0o666) != nil {
+		return err
+	}
+	return os.Rename(source, target)
+}
+
+// runTransfer runs work on its own goroutine while the calling goroutine keeps
+// reporting progress. Called from a plugin export, the calling goroutine owns
+// Total Commander's thread, the only thread that may invoke its callbacks, so
+// polling here keeps Cancel responsive even while the network is stalled.
+// Cancel and stalls cancel work's context, and the AWS SDK never retries a
+// canceled request. runTransfer always waits for work to return, so callers
+// may then inspect anything work wrote.
+func runTransfer(p *progress, done, total *atomic.Int64, work func(context.Context) error) error {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	result := make(chan error, 1)
+	go func() { result <- work(ctx) }()
+	stop := func(cause error) error {
+		cancel(cause)
+		<-result
+		return cause
+	}
+
+	ticker := time.NewTicker(progressInterval)
+	defer ticker.Stop()
+	lastDone, lastMoved := done.Load(), time.Now()
+	for {
+		select {
+		case err := <-result:
+			return err
+		case now := <-ticker.C:
+			current := done.Load()
+			if current != lastDone {
+				lastDone, lastMoved = current, now
+			}
+			p.total = total.Load()
+			if p.update(current) {
+				return stop(ErrUserAbort)
+			}
+			if idle := now.Sub(lastMoved); idle >= transferIdleTimeout {
+				return stop(fmt.Errorf("no data transferred for %s: %w", idle.Round(time.Second), ErrTransferStalled))
+			}
+		}
+	}
+}
+
 type progress struct {
 	callbacks Callbacks
 	source    string
@@ -516,14 +583,6 @@ func (p *progress) start() bool {
 func (p *progress) update(done int64) bool {
 	p.done = done
 	return p.report(done, false)
-}
-
-// rewind re-anchors the byte counter after the source was replayed so that the
-// next report reflects the resumed position instead of the abandoned one.
-func (p *progress) rewind(done int64) {
-	p.done = done
-	p.lastPct = -1
-	p.last = time.Time{}
 }
 
 func (p *progress) finish() bool {
@@ -554,37 +613,42 @@ func (p *progress) report(done int64, force bool) bool {
 	return p.callbacks.Progress(p.source, p.target, pct)
 }
 
-type progressWriter struct {
-	writer   io.Writer
-	progress *progress
-	writeErr error
+// countingWriter receives a download and counts the bytes written locally for
+// runTransfer. It is only used by the transfer goroutine, and runTransfer's
+// wait makes err safe to read once it returns.
+type countingWriter struct {
+	writer io.Writer
+	done   *atomic.Int64
+	err    error
 }
 
-func (w *progressWriter) Write(data []byte) (int, error) {
+func (w *countingWriter) Write(data []byte) (int, error) {
 	n, err := w.writer.Write(data)
+	w.done.Add(int64(n))
 	if err != nil {
-		w.writeErr = err
-		return n, err
+		w.err = err
 	}
-	if n > 0 && w.progress.update(w.progress.done+int64(n)) {
-		return n, ErrUserAbort
-	}
-	return n, nil
+	return n, err
 }
 
-type progressReader struct {
-	reader   io.ReadSeeker
-	progress *progress
-	readErr  error
+// countingReader feeds an upload and counts the bytes the SDK has read for
+// runTransfer. The HTTP transport reads it on its own goroutine, so readErr is
+// guarded.
+type countingReader struct {
+	reader io.ReadSeeker
+	done   *atomic.Int64
+
+	mu      sync.Mutex
+	readErr error
 }
 
-func (r *progressReader) Read(data []byte) (int, error) {
+func (r *countingReader) Read(data []byte) (int, error) {
 	n, err := r.reader.Read(data)
-	if n > 0 && r.progress.update(r.progress.done+int64(n)) {
-		return n, ErrUserAbort
-	}
+	r.done.Add(int64(n))
 	if err != nil && !errors.Is(err, io.EOF) {
+		r.mu.Lock()
 		r.readErr = err
+		r.mu.Unlock()
 	}
 	return n, err
 }
@@ -592,14 +656,23 @@ func (r *progressReader) Read(data []byte) (int, error) {
 // Seek keeps the upload body rewindable. The AWS SDK replays the body to
 // compute the SigV4 payload hash for plain-HTTP endpoints, and again before
 // every retry; a reader that only satisfies io.Reader fails both with
-// "request stream is not seekable". Re-anchoring the progress accounting here
-// keeps a replayed body from being reported as additional transferred bytes.
-func (r *progressReader) Seek(offset int64, whence int) (int64, error) {
+// "request stream is not seekable". Storing the new position keeps a replayed
+// body from being counted as additional transferred bytes.
+func (r *countingReader) Seek(offset int64, whence int) (int64, error) {
 	position, err := r.reader.Seek(offset, whence)
 	if err != nil {
 		return position, err
 	}
+	r.mu.Lock()
 	r.readErr = nil
-	r.progress.rewind(position)
+	r.mu.Unlock()
+	r.done.Store(position)
 	return position, nil
+}
+
+// readError returns the last local read failure, if any.
+func (r *countingReader) readError() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.readErr
 }

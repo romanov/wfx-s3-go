@@ -3,10 +3,12 @@ package s3store
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -91,6 +93,37 @@ func TestStoreUsesPathStyleAndS3Operations(t *testing.T) {
 	}
 	if err := store.Delete(context.Background(), profile, "upload.txt"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStoreDownloadReportsMissingObjectAsNotExist(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		code     string
+		notExist bool
+	}{
+		{name: "missing key", status: http.StatusNotFound, code: "NoSuchKey", notExist: true},
+		{name: "access denied", status: http.StatusForbidden, code: "AccessDenied", notExist: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Content-Type", "application/xml")
+				response.WriteHeader(test.status)
+				_, _ = fmt.Fprintf(response, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>test</Message></Error>`, test.code)
+			}))
+			defer server.Close()
+			profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket", AccessKey: "a", SecretKey: "s", PathStyle: true}
+
+			_, err := New().Download(context.Background(), profile, "file.txt")
+			if err == nil {
+				t.Fatal("expected a download error")
+			}
+			if got := errors.Is(err, os.ErrNotExist); got != test.notExist {
+				t.Fatalf("errors.Is(err, os.ErrNotExist) = %v, want %v: %v", got, test.notExist, err)
+			}
+		})
 	}
 }
 

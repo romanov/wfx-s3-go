@@ -40,6 +40,12 @@ static inline void wfx_set_last_error(DWORD code) {
     SetLastError(code);
 }
 
+static inline int wfx_ansi_to_wide(UINT codePage, const char *source,
+    int sourceLength, WCHAR *target, int targetLength) {
+    return MultiByteToWideChar(codePage, 0, source, sourceLength, target,
+        targetLength);
+}
+
 // Total Commander unloads a WFX DLL immediately after calling
 // FsGetDefRootName during plugin installation. Go c-shared DLLs cannot be
 // safely unloaded while their runtime is still active, so pin this module in
@@ -56,6 +62,7 @@ static inline int wfx_pin_module(void) {
 import "C"
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"runtime"
@@ -115,31 +122,36 @@ func FsInitW(pluginNr C.int, progress unsafe.Pointer, log unsafe.Pointer, reques
 	return 0
 }
 
+// The find handle is an opaque token rather than a pointer, so the find exports
+// use uintptr, which has the same x64 ABI as HANDLE.
+
 //export FsFindFirstW
-func FsFindFirstW(remotePath *C.wchar_t, findData *C.WIN32_FIND_DATAW) unsafe.Pointer {
+func FsFindFirstW(remotePath *C.wchar_t, findData *C.WIN32_FIND_DATAW) uintptr {
 	if findData == nil {
 		setLastError(uint32(C.ERROR_INVALID_PARAMETER))
-		return unsafe.Pointer(uintptr(invalidHandle))
+		return invalidHandle
 	}
 	token, entry, err := service.FindFirst(readWideString(remotePath))
 	if err != nil {
-		setFindError(err)
+		// Report before setting the last error: the log and message-box
+		// callbacks can overwrite it before Total Commander reads it.
 		if !errors.Is(err, wfx.ErrEmptyDirectory) {
 			service.ReportError(err)
 		}
-		return unsafe.Pointer(uintptr(invalidHandle))
+		setFindError(err)
+		return invalidHandle
 	}
 	fillFindData(findData, entry)
-	return unsafe.Pointer(uintptr(token))
+	return uintptr(token)
 }
 
 //export FsFindNextW
-func FsFindNextW(handle unsafe.Pointer, findData *C.WIN32_FIND_DATAW) C.int {
+func FsFindNextW(handle uintptr, findData *C.WIN32_FIND_DATAW) C.int {
 	if findData == nil {
 		setLastError(uint32(C.ERROR_INVALID_PARAMETER))
 		return 0
 	}
-	entry, ok, err := service.FindNext(handleToken(handle))
+	entry, ok, err := service.FindNext(uint64(handle))
 	if err != nil {
 		setLastError(uint32(C.ERROR_INVALID_HANDLE))
 		return 0
@@ -152,10 +164,9 @@ func FsFindNextW(handle unsafe.Pointer, findData *C.WIN32_FIND_DATAW) C.int {
 }
 
 //export FsFindClose
-func FsFindClose(handle unsafe.Pointer) C.int {
-	token := handleToken(handle)
-	if token != 0 && token != uint64(invalidHandle) {
-		service.FindClose(token)
+func FsFindClose(handle uintptr) C.int {
+	if handle != 0 && handle != invalidHandle {
+		service.FindClose(uint64(handle))
 	}
 	return 0
 }
@@ -214,8 +225,30 @@ func FsSetDefaultParams(defaults *C.FsDefaultParamStruct) {
 	if defaults == nil {
 		return
 	}
-	name := C.GoString((*C.char)(unsafe.Pointer(&defaults.DefaultIniName[0])))
-	service.SetDefaultIniName(name)
+	raw := C.GoBytes(unsafe.Pointer(&defaults.DefaultIniName[0]), C.int(len(defaults.DefaultIniName)))
+	service.SetDefaultIniName(decodeANSI(C.CP_ACP, raw))
+}
+
+// decodeANSI converts a NUL-terminated string in the given Windows code page.
+// FsSetDefaultParams has no Unicode variant, so Total Commander passes the INI
+// path in the ANSI code page; reading it as UTF-8 would corrupt every non-ASCII
+// character and point the plugin at a directory that does not exist.
+func decodeANSI(codePage uint32, value []byte) string {
+	if end := bytes.IndexByte(value, 0); end >= 0 {
+		value = value[:end]
+	}
+	if len(value) == 0 {
+		return ""
+	}
+	// No code page produces more UTF-16 units than the bytes it consumed.
+	wide := make([]uint16, len(value))
+	length := C.wfx_ansi_to_wide(C.UINT(codePage),
+		(*C.char)(unsafe.Pointer(&value[0])), C.int(len(value)),
+		(*C.WCHAR)(unsafe.Pointer(&wide[0])), C.int(len(wide)))
+	if length <= 0 {
+		return ""
+	}
+	return readUTF16Buffer(wide[:length])
 }
 
 func readWideString(value *C.wchar_t) string {
@@ -265,20 +298,23 @@ func boolInt(value bool) int {
 	return 0
 }
 
+// The WFX SDK's value for an entry without a time stamp. Total Commander leaves
+// the date column empty instead of showing 01.01.1601 for a zero FILETIME.
+const (
+	noFileTimeLow  = 0xFFFFFFFE
+	noFileTimeHigh = 0xFFFFFFFF
+)
+
 func fileTime(value time.Time) (uint32, uint32) {
 	if value.IsZero() {
-		return 0, 0
+		return noFileTimeLow, noFileTimeHigh
 	}
 	const windowsEpochOffset = int64(11644473600)
 	intervals := (value.Unix()+windowsEpochOffset)*10000000 + int64(value.Nanosecond()/100)
 	if intervals < 0 {
-		return 0, 0
+		return noFileTimeLow, noFileTimeHigh
 	}
 	return splitUint64(uint64(intervals))
-}
-
-func handleToken(handle unsafe.Pointer) uint64 {
-	return uint64(uintptr(handle))
 }
 
 func setLastError(code uint32) {
