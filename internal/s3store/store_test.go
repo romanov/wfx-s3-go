@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -196,6 +197,48 @@ func TestStoreObjectPathEscapesKeys(t *testing.T) {
 	}
 	if escapedPath != "/bucket/a%20b.txt" {
 		t.Fatalf("unexpected escaped request path: %s", escapedPath)
+	}
+}
+
+func TestStoreProbeReportsStatusAndRequestID(t *testing.T) {
+	var query url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		query = request.URL.Query()
+		response.Header().Set("Content-Type", "application/xml")
+		response.Header().Set("x-amz-request-id", "REQ200")
+		_, _ = fmt.Fprint(response, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>bucket</Name><Prefix>base/</Prefix><KeyCount>0</KeyCount><MaxKeys>1</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`)
+	}))
+	defer server.Close()
+	profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket", Prefix: "base/", AccessKey: "a", SecretKey: "s", PathStyle: true}
+
+	result, err := New().Probe(context.Background(), profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.StatusCode != http.StatusOK || result.RequestID != "REQ200" {
+		t.Fatalf("unexpected probe result: %+v", result)
+	}
+	if query.Get("list-type") != "2" || query.Get("max-keys") != "1" || query.Get("prefix") != "base/" || query.Get("delimiter") != "/" {
+		t.Fatalf("the probe is not a one-key listing of the profile prefix: %v", query)
+	}
+}
+
+func TestStoreProbeReportsErrorResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		response.Header().Set("Content-Type", "application/xml")
+		response.Header().Set("x-amz-request-id", "REQ403")
+		response.WriteHeader(http.StatusForbidden)
+		_, _ = fmt.Fprint(response, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>AccessDenied</Code><Message>Access Denied</Message><RequestId>REQ403</RequestId></Error>`)
+	}))
+	defer server.Close()
+	profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket", AccessKey: "a", SecretKey: "s", PathStyle: true}
+
+	result, err := New().Probe(context.Background(), profile)
+	if err == nil || !strings.Contains(err.Error(), "AccessDenied") {
+		t.Fatalf("expected an access-denied error, got %v", err)
+	}
+	if result.StatusCode != http.StatusForbidden || result.RequestID != "REQ403" {
+		t.Fatalf("unexpected probe result: %+v", result)
 	}
 }
 

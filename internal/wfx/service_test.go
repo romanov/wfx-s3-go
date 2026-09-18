@@ -27,6 +27,9 @@ type fakeBackend struct {
 	deleted     []string
 	uploads     map[string][]byte
 	downloadErr error
+
+	probeErrs    map[string]error // by profile name
+	probeRelease chan struct{}    // when set, Probe waits until it is closed
 }
 
 func newFakeBackend() *fakeBackend {
@@ -76,6 +79,20 @@ func (f *fakeBackend) Delete(_ context.Context, profile config.Profile, key stri
 	delete(f.objects, id)
 	f.deleted = append(f.deleted, id)
 	return nil
+}
+
+func (f *fakeBackend) Probe(ctx context.Context, profile config.Profile) (s3store.ProbeResult, error) {
+	if f.probeRelease != nil {
+		select {
+		case <-f.probeRelease:
+		case <-ctx.Done():
+			return s3store.ProbeResult{}, ctx.Err()
+		}
+	}
+	if err := f.probeErrs[profile.Name]; err != nil {
+		return s3store.ProbeResult{StatusCode: http.StatusForbidden, RequestID: "REQ-" + profile.Name}, err
+	}
+	return s3store.ProbeResult{StatusCode: http.StatusOK, RequestID: "REQ-" + profile.Name}, nil
 }
 
 func newTestService(t *testing.T, backend *fakeBackend) config.Profile {

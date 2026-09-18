@@ -74,6 +74,24 @@ shared or untrusted machines.
 3. Click Add and select `dist\wfxs3.wfx64`.
 4. Open Network Neighborhood and enter the `S3 (Go)` plugin root.
 
+## Debug information
+
+Press Alt+Enter (or right-click and choose Properties) on `S3 (Go)` in
+Network Neighborhood, or on any profile, folder, or object inside it, to
+open the debug dialog. It shows:
+
+- the plugin build, the Total Commander version, and the settings file
+  with its load status or last error;
+- each profile's settings, with the access key masked (secret keys and
+  session tokens are never displayed);
+- for an item, the `s3://bucket/key` location it maps to;
+- the last 100 operations, with their durations and full error messages.
+
+**Test connections** sends a one-key listing request for every profile and
+shows each HTTP status, request ID, and error. **Open wfxs3.ini** opens the
+settings file in its associated editor, and **Copy all** copies the report
+to the clipboard, for example to attach it to a bug report.
+
 ## Current limitations
 
 - x64 only; there is no 32-bit build.

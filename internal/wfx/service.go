@@ -97,13 +97,19 @@ type Service struct {
 	callbacks Callbacks
 	backend   s3store.Backend
 
-	configPath string
-	config     config.Config
-	configInfo fileStamp
-	loaded     bool
+	configPath     string
+	config         config.Config
+	configInfo     fileStamp
+	loaded         bool
+	configErr      error     // why the last load failed; nil once one succeeds
+	configLoadedAt time.Time // when config was last parsed
 
 	handles   map[uint64]*findState
 	nextToken uint64
+
+	test connectionTest
+
+	activity activityLog
 }
 
 type fileStamp struct {
@@ -130,10 +136,17 @@ func (s *Service) SetCallbacks(callbacks Callbacks) {
 // rely on a fresh Service value to clear configuration state.
 func (s *Service) ResetConfig() {
 	s.mu.Lock()
+	s.clearConfigLocked()
+	s.mu.Unlock()
+}
+
+// clearConfigLocked discards the parsed configuration. s.mu must be held.
+func (s *Service) clearConfigLocked() {
 	s.config = config.Config{}
 	s.configInfo = fileStamp{}
 	s.loaded = false
-	s.mu.Unlock()
+	s.configErr = nil
+	s.configLoadedAt = time.Time{}
 }
 
 // SetDefaultIniName converts Total Commander's suggested wincmd.ini path into
@@ -145,9 +158,7 @@ func (s *Service) SetDefaultIniName(defaultIniName string) {
 	}
 	s.mu.Lock()
 	s.configPath = filepath.Join(filepath.Dir(defaultIniName), "wfxs3.ini")
-	s.config = config.Config{}
-	s.configInfo = fileStamp{}
-	s.loaded = false
+	s.clearConfigLocked()
 	s.mu.Unlock()
 }
 
@@ -158,16 +169,28 @@ func (s *Service) ConfigPath() string {
 }
 
 func (s *Service) FindFirst(remote string) (uint64, FindData, error) {
+	start := time.Now()
+	entries, err := s.list(remote)
+	if err != nil {
+		s.record("list", remote, "", start, "error", err)
+		return 0, FindData{}, err
+	}
+	s.record("list", remote, "("+countNoun(len(entries), "entry", "entries")+")", start, "ok", nil)
+	return s.openFind(entries)
+}
+
+// list returns the sorted entries of a remote directory.
+func (s *Service) list(remote string) ([]FindData, error) {
 	// Total Commander may enter directly through a saved subdirectory instead
 	// of enumerating the plugin root first. Always reload at this new listing
 	// boundary so that the selected connection reflects the current INI.
 	if err := s.reloadConfig(true); err != nil {
-		return 0, FindData{}, fmt.Errorf("load %s: %w", s.ConfigPath(), err)
+		return nil, fmt.Errorf("load %s: %w", s.ConfigPath(), err)
 	}
 
 	profileName, relative, err := pathutil.ParseRemote(remote)
 	if err != nil {
-		return 0, FindData{}, err
+		return nil, err
 	}
 	if profileName == "" {
 		entries := make([]FindData, 0)
@@ -176,18 +199,18 @@ func (s *Service) FindFirst(remote string) (uint64, FindData, error) {
 			entries = append(entries, FindData{Name: name, Directory: true})
 		}
 		s.mu.RUnlock()
-		return s.openFind(entries)
+		return entries, nil
 	}
 
 	profile, ok := s.profile(profileName)
 	if !ok {
-		return 0, FindData{}, fmt.Errorf("profile %q is not configured", profileName)
+		return nil, fmt.Errorf("profile %q is not configured", profileName)
 	}
 	listCtx, cancelList := metadataContext()
 	defer cancelList()
 	entries, err := s.backend.List(listCtx, profile, relative)
 	if err != nil {
-		return 0, FindData{}, fmt.Errorf("list %s: %w", remote, err)
+		return nil, fmt.Errorf("list %s: %w", remote, err)
 	}
 	data := make([]FindData, 0, len(entries))
 	for _, entry := range entries {
@@ -204,7 +227,7 @@ func (s *Service) FindFirst(remote string) (uint64, FindData, error) {
 		}
 		return strings.ToLower(data[i].Name) < strings.ToLower(data[j].Name)
 	})
-	return s.openFind(data)
+	return data, nil
 }
 
 func (s *Service) openFind(entries []FindData) (uint64, FindData, error) {
@@ -245,6 +268,13 @@ func (s *Service) FindClose(token uint64) {
 }
 
 func (s *Service) GetFile(remote, local string, flags int) (int, error) {
+	start := time.Now()
+	status, err := s.getFile(remote, local, flags)
+	s.recordTransfer("get", remote, local, flags, start, status, err)
+	return status, err
+}
+
+func (s *Service) getFile(remote, local string, flags int) (int, error) {
 	if flags&CopyResume != 0 {
 		return FileNotSupported, nil
 	}
@@ -330,6 +360,13 @@ func (s *Service) GetFile(remote, local string, flags int) (int, error) {
 }
 
 func (s *Service) PutFile(local, remote string, flags int) (int, error) {
+	start := time.Now()
+	status, err := s.putFile(local, remote, flags)
+	s.recordTransfer("put", local, remote, flags, start, status, err)
+	return status, err
+}
+
+func (s *Service) putFile(local, remote string, flags int) (int, error) {
 	if flags&CopyResume != 0 {
 		return FileNotSupported, nil
 	}
@@ -395,6 +432,13 @@ func (s *Service) PutFile(local, remote string, flags int) (int, error) {
 }
 
 func (s *Service) DeleteFile(remote string) (bool, error) {
+	start := time.Now()
+	ok, err := s.deleteFile(remote)
+	s.record("delete", remote, "", start, resultStatus(err), err)
+	return ok, err
+}
+
+func (s *Service) deleteFile(remote string) (bool, error) {
 	profile, key, err := s.resolveObject(remote)
 	if err != nil {
 		return false, err
@@ -433,17 +477,18 @@ func (s *Service) profile(name string) (config.Profile, bool) {
 }
 
 func (s *Service) reloadConfig(force bool) error {
+	start := time.Now()
 	s.mu.RLock()
 	filename := s.configPath
 	loaded := s.loaded
 	stamp := s.configInfo
 	s.mu.RUnlock()
 	if filename == "" {
-		return errors.New("Total Commander did not provide the settings directory")
+		return s.configFailed(errors.New("Total Commander did not provide the settings directory"))
 	}
 	info, err := os.Stat(filename)
 	if err != nil {
-		return err
+		return s.configFailed(err)
 	}
 	current := fileStamp{modTime: info.ModTime(), size: info.Size()}
 	if loaded && !force && current == stamp {
@@ -451,24 +496,39 @@ func (s *Service) reloadConfig(force bool) error {
 	}
 	cfg, err := config.Load(filename)
 	if err != nil {
-		return err
+		return s.configFailed(err)
 	}
 	s.mu.Lock()
+	changed := !s.loaded || s.configErr != nil || current != s.configInfo
 	s.config = cfg
 	s.configInfo = current
 	s.loaded = true
+	s.configErr = nil
+	s.configLoadedAt = time.Now()
 	s.mu.Unlock()
 
+	names := cfg.Names()
+	profiles := "<none>"
+	if len(names) > 0 {
+		profiles = strings.Join(names, ", ")
+	}
+	// FindFirst reloads on every listing, so record only a changed file.
+	if changed {
+		s.record("config", filename, "(profiles: "+profiles+")", start, "ok", nil)
+	}
 	callbacks := s.callbacksSnapshot()
 	if callbacks.Log != nil {
-		names := cfg.Names()
-		profiles := "<none>"
-		if len(names) > 0 {
-			profiles = strings.Join(names, ", ")
-		}
 		callbacks.Log(MessageDetails, fmt.Sprintf("loaded %s; profiles: %s", filename, profiles))
 	}
 	return nil
+}
+
+// configFailed keeps a load failure for the debug report and returns it.
+func (s *Service) configFailed(err error) error {
+	s.mu.Lock()
+	s.configErr = err
+	s.mu.Unlock()
+	return err
 }
 
 func (s *Service) callbacksSnapshot() Callbacks {

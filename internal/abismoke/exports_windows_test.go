@@ -28,6 +28,7 @@ func TestWFXExports(t *testing.T) {
 		"FsGetFileW",
 		"FsPutFileW",
 		"FsDeleteFileW",
+		"FsExecuteFileW",
 		"FsGetDefRootName",
 		"FsSetDefaultParams",
 	}

@@ -13,11 +13,13 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 
 	"github.com/example/wfxs3/internal/config"
 	"github.com/example/wfxs3/internal/path"
@@ -38,6 +40,14 @@ type Object struct {
 	LastModified time.Time
 }
 
+// ProbeResult describes the response to a connection probe. Either field is
+// zero when the service did not provide it, for example when no connection
+// could be made.
+type ProbeResult struct {
+	StatusCode int
+	RequestID  string
+}
+
 // Backend is the small S3 surface used by the WFX layer and tests. Download
 // returns an error wrapping os.ErrNotExist when the object does not exist.
 type Backend interface {
@@ -46,6 +56,7 @@ type Backend interface {
 	Download(context.Context, config.Profile, string) (Object, error)
 	Upload(context.Context, config.Profile, string, io.Reader, int64) error
 	Delete(context.Context, config.Profile, string) error
+	Probe(context.Context, config.Profile) (ProbeResult, error)
 }
 
 const (
@@ -220,6 +231,37 @@ func (s *Store) Delete(ctx context.Context, profile config.Profile, key string) 
 		Key:    aws.String(path.ObjectKey(profile, key)),
 	})
 	return err
+}
+
+// Probe sends the smallest request that browsing depends on: a one-key listing
+// of the profile's prefix. The result carries the HTTP status and request ID,
+// including those of an error response, so that a failure can be reported to
+// the storage provider.
+func (s *Store) Probe(ctx context.Context, profile config.Profile) (ProbeResult, error) {
+	output, err := s.client(profile).ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(profile.Bucket),
+		Delimiter: aws.String("/"),
+		Prefix:    aws.String(profile.Prefix),
+		MaxKeys:   aws.Int32(1),
+	})
+	if err != nil {
+		var result ProbeResult
+		var status interface{ HTTPStatusCode() int }
+		if errors.As(err, &status) {
+			result.StatusCode = status.HTTPStatusCode()
+		}
+		var request interface{ ServiceRequestID() string }
+		if errors.As(err, &request) {
+			result.RequestID = request.ServiceRequestID()
+		}
+		return result, err
+	}
+	var result ProbeResult
+	if response, ok := awsmiddleware.GetRawResponse(output.ResultMetadata).(*smithyhttp.Response); ok {
+		result.StatusCode = response.StatusCode
+	}
+	result.RequestID, _ = awsmiddleware.GetRequestIDMetadata(output.ResultMetadata)
+	return result, nil
 }
 
 func isNotFound(err error) bool {

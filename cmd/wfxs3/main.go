@@ -64,13 +64,17 @@ import "C"
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unicode/utf16"
 	"unsafe"
 
+	"github.com/example/wfxs3/internal/debugui"
 	"github.com/example/wfxs3/internal/s3store"
 	"github.com/example/wfxs3/internal/wfx"
 )
@@ -80,7 +84,31 @@ const (
 	invalidHandle = ^uintptr(0)
 )
 
+// Return values of FsExecuteFileW, from fsplugin.h.
+const (
+	execOK       = 0
+	execError    = 1
+	execYourself = -1
+)
+
 var service = wfx.New(s3store.New())
+
+// host is what Total Commander has told the plugin about itself, for the
+// debug dialog.
+var (
+	hostMu sync.Mutex
+	host   wfx.HostInfo
+)
+
+// executableInfo returns the host executable and its file version, which do
+// not change while the plugin is loaded.
+var executableInfo = sync.OnceValues(func() (string, string) {
+	executable, err := os.Executable()
+	if err != nil {
+		return "", ""
+	}
+	return executable, debugui.FileVersion(executable)
+})
 
 type callbackPointers struct {
 	pluginNr uintptr
@@ -102,6 +130,10 @@ func pinModule() {
 func FsInitW(pluginNr C.int, progress unsafe.Pointer, log unsafe.Pointer, request unsafe.Pointer) C.int {
 	pinModule()
 	service.ResetConfig()
+	hostMu.Lock()
+	host.PluginNr = int(pluginNr)
+	host.Initialized = time.Now()
+	hostMu.Unlock()
 	pointers := callbackPointers{
 		pluginNr: uintptr(pluginNr),
 		progress: uintptr(progress),
@@ -226,7 +258,79 @@ func FsSetDefaultParams(defaults *C.FsDefaultParamStruct) {
 		return
 	}
 	raw := C.GoBytes(unsafe.Pointer(&defaults.DefaultIniName[0]), C.int(len(defaults.DefaultIniName)))
-	service.SetDefaultIniName(decodeANSI(C.CP_ACP, raw))
+	iniName := decodeANSI(C.CP_ACP, raw)
+	hostMu.Lock()
+	host.InterfaceVersion = interfaceVersion(uint32(defaults.PluginInterfaceVersionHi), uint32(defaults.PluginInterfaceVersionLow))
+	host.DefaultIniName = iniName
+	hostMu.Unlock()
+	service.SetDefaultIniName(iniName)
+}
+
+// interfaceVersion formats the WFX interface version. The SDK stores the
+// digits after the decimal point multiplied by 100, so 1.3 is 1 and 30.
+func interfaceVersion(high, low uint32) string {
+	return fmt.Sprintf("%d.%02d", high, low)
+}
+
+// Like the find handle, MainWin is used only as an opaque value, and uintptr
+// has the same x64 ABI as HWND.
+
+//export FsExecuteFileW
+func FsExecuteFileW(mainWin uintptr, remoteName *C.wchar_t, verb *C.wchar_t) C.int {
+	switch classifyVerb(readWideString(verb)) {
+	case verbOpen:
+		// Let Total Commander download the object through FsGetFileW and open
+		// the local copy.
+		return execYourself
+	case verbProperties:
+		showDebugDialog(mainWin, readWideString(remoteName))
+		return execOK
+	}
+	return execError
+}
+
+type verbKind int
+
+const (
+	verbOther verbKind = iota
+	verbOpen
+	verbProperties
+)
+
+// classifyVerb maps an FsExecuteFileW verb, such as "open", "properties",
+// "chmod 755" or "quote <command line>", to how the plugin handles it.
+func classifyVerb(verb string) verbKind {
+	name, _, _ := strings.Cut(strings.TrimSpace(verb), " ")
+	switch strings.ToLower(name) {
+	case "open":
+		return verbOpen
+	case "properties":
+		return verbProperties
+	}
+	return verbOther
+}
+
+// showDebugDialog shows the plugin's state for Alt+Enter on the plugin root or
+// on any item inside it. It runs on Total Commander's thread, as the report
+// requires.
+func showDebugDialog(owner uintptr, selected string) {
+	err := debugui.Show(owner, "WFX S3 — Debug info", debugui.Actions{
+		Report:      func() string { return service.DebugReport(currentHost(), selected) },
+		ConfigPath:  service.ConfigPath,
+		StartTest:   func() bool { return service.StartConnectionTest() != nil },
+		TestRunning: service.ConnectionTestRunning,
+	})
+	if err != nil {
+		service.ReportError(err)
+	}
+}
+
+func currentHost() wfx.HostInfo {
+	hostMu.Lock()
+	info := host
+	hostMu.Unlock()
+	info.Executable, info.Version = executableInfo()
+	return info
 }
 
 // decodeANSI converts a NUL-terminated string in the given Windows code page.
