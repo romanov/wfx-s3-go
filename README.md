@@ -47,7 +47,7 @@ path_style=true
 ```
 
 The profile name becomes a directory under the plugin root. For example,
-`\\S3 (Go)\\my-server\\documents` is represented internally as the configured
+`\\S3 API Endpoints\\my-server\\documents` is represented internally as the configured
 bucket and prefix.
 
 `endpoint`, `bucket`, `access_key`, and `secret_key` are required. `region`,
@@ -72,11 +72,11 @@ shared or untrusted machines.
 1. Build the plugin.
 2. In Total Commander, open Configuration → Options → Plugins → FS Plugins.
 3. Click Add and select `dist\wfxs3.wfx64`.
-4. Open Network Neighborhood and enter the `S3 (Go)` plugin root.
+4. Open Network Neighborhood and enter the `S3 API Endpoints` plugin root.
 
 ## Debug information
 
-Press Alt+Enter (or right-click and choose Properties) on `S3 (Go)` in
+Press Alt+Enter (or right-click and choose Properties) on `S3 API Endpoints` in
 Network Neighborhood, or on any profile, folder, or object inside it, to
 open the debug dialog. It shows:
 

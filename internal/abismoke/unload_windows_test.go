@@ -44,7 +44,7 @@ try {
     $address, [WFXS3UnloadProbe+Root])
   $root.Invoke($buffer, 260)
   $value = [Runtime.InteropServices.Marshal]::PtrToStringAnsi($buffer)
-  if ($value -ne "S3 (Go)") {
+  if ($value -ne "S3 API Endpoints") {
     throw "unexpected root name: $value"
   }
 } finally {

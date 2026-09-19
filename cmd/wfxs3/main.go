@@ -245,7 +245,7 @@ func FsGetDefRootName(rootName *C.char, maxLen C.int) {
 	for i := range buffer {
 		buffer[i] = 0
 	}
-	root := []byte("S3 (Go)")
+	root := []byte("S3 API Endpoints")
 	if len(root) >= len(buffer) {
 		root = root[:len(buffer)-1]
 	}
