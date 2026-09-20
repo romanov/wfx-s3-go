@@ -12,6 +12,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 
@@ -20,6 +21,7 @@ import (
 
 func TestStoreUsesPathStyleAndS3Operations(t *testing.T) {
 	var uploaded []byte
+	var putHeader http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		if !strings.HasPrefix(request.URL.Path, "/bucket") {
 			http.Error(response, "expected path-style request", http.StatusBadRequest)
@@ -42,6 +44,7 @@ func TestStoreUsesPathStyleAndS3Operations(t *testing.T) {
 			response.Header().Set("Content-Length", "5")
 		case http.MethodPut:
 			var err error
+			putHeader = request.Header.Clone()
 			uploaded, err = io.ReadAll(request.Body)
 			if err != nil {
 				http.Error(response, err.Error(), http.StatusInternalServerError)
@@ -86,11 +89,24 @@ func TestStoreUsesPathStyleAndS3Operations(t *testing.T) {
 	if err != nil || string(data) != "hello" {
 		t.Fatalf("download failed: %q %v", data, err)
 	}
-	if err := store.Upload(context.Background(), profile, "upload.txt", bytes.NewReader([]byte("uploaded")), 8); err != nil {
+	modTime := time.Unix(1700000000, 123456789)
+	input := UploadInput{
+		Body:        bytes.NewReader([]byte("uploaded")),
+		Size:        8,
+		ContentType: "text/plain; charset=utf-8",
+		ModTime:     modTime,
+	}
+	if err := store.Upload(context.Background(), profile, "upload.txt", input); err != nil {
 		t.Fatal(err)
 	}
 	if string(uploaded) != "uploaded" {
 		t.Fatalf("unexpected uploaded body: %q", uploaded)
+	}
+	if got := putHeader.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+		t.Errorf("Content-Type = %q", got)
+	}
+	if got, want := putHeader.Get("X-Amz-Meta-Mtime"), formatModTime(modTime); got != want {
+		t.Errorf("X-Amz-Meta-Mtime = %q, want %q", got, want)
 	}
 	if err := store.Delete(context.Background(), profile, "upload.txt"); err != nil {
 		t.Fatal(err)
@@ -253,5 +269,78 @@ func TestStoreHTTPClientAppliesTimeouts(t *testing.T) {
 	}
 	if got := client.GetTransport().ResponseHeaderTimeout; got != responseHeaderTimeout {
 		t.Errorf("response header timeout = %s, want %s", got, responseHeaderTimeout)
+	}
+}
+
+func TestStoreUploadOmitsUnsetContentTypeAndModTime(t *testing.T) {
+	var putHeader http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, request *http.Request) {
+		putHeader = request.Header.Clone()
+		_, _ = io.ReadAll(request.Body)
+	}))
+	defer server.Close()
+	profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket", AccessKey: "a", SecretKey: "s", PathStyle: true}
+
+	input := UploadInput{Body: bytes.NewReader([]byte("body")), Size: 4}
+	if err := New().Upload(context.Background(), profile, "file.bin", input); err != nil {
+		t.Fatal(err)
+	}
+	// With nothing set the SDK supplies application/octet-stream itself, so an
+	// unrecognised extension behaves exactly as it did before Content-Type
+	// detection existed. This pins that the plugin adds nothing of its own.
+	if got := putHeader.Get("Content-Type"); got != "application/octet-stream" {
+		t.Errorf("Content-Type = %q, want the SDK default", got)
+	}
+	for name := range putHeader {
+		if strings.HasPrefix(strings.ToLower(name), "x-amz-meta-") {
+			t.Errorf("unexpected user metadata header %q", name)
+		}
+	}
+}
+
+func TestStoreDownloadReadsModTimeMetadata(t *testing.T) {
+	const lastModified = "Thu, 02 Jan 2025 03:04:05 GMT"
+	tests := []struct {
+		name     string
+		metadata string
+		want     time.Time
+	}{
+		{"rclone style", "1700000000.123456789", time.Unix(1700000000, 123456789)},
+		{"s3fs style", "1700000000", time.Unix(1700000000, 0)},
+		{"absent", "", time.Time{}},
+		{"unreadable", "not-a-time", time.Time{}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+				response.Header().Set("Last-Modified", lastModified)
+				if test.metadata != "" {
+					// Written in the wire form; the SDK strips the prefix and
+					// lowercases the rest, which is what Download relies on.
+					response.Header().Set("x-amz-meta-mtime", test.metadata)
+				}
+				_, _ = response.Write([]byte("hello"))
+			}))
+			defer server.Close()
+			profile := config.Profile{Name: "demo", Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket", AccessKey: "a", SecretKey: "s", PathStyle: true}
+
+			object, err := New().Download(context.Background(), profile, "file.txt")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_ = object.Body.Close()
+			if !object.ModTime.Equal(test.want) {
+				t.Errorf("ModTime = %v, want %v", object.ModTime.UTC(), test.want.UTC())
+			}
+			// A bad or missing source time stamp must not disturb the object's
+			// own, which is the fallback the download path uses next.
+			want, err := time.Parse(http.TimeFormat, lastModified)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !object.LastModified.Equal(want) {
+				t.Errorf("LastModified = %v, want %v", object.LastModified.UTC(), want)
+			}
+		})
 	}
 }

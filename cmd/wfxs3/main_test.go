@@ -68,3 +68,44 @@ func TestFileTime(t *testing.T) {
 		t.Fatalf("Unix epoch = %#x/%#x, want 0xd53e8000/0x19db1de", low, high)
 	}
 }
+
+func TestTimeFromFileTime(t *testing.T) {
+	tests := []struct {
+		name string
+		low  uint32
+		high uint32
+		want time.Time
+	}{
+		// fillFindData writes this for every entry without a time stamp, and
+		// Total Commander hands it straight back in RemoteInfoStruct.
+		{"the no-time sentinel", noFileTimeLow, noFileTimeHigh, time.Time{}},
+		{"a zero FILETIME", 0, 0, time.Time{}},
+		{"the Unix epoch", 0xD53E8000, 0x019DB1DE, time.Unix(0, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := timeFromFileTime(test.low, test.high); !got.Equal(test.want) {
+				t.Errorf("timeFromFileTime(%#x, %#x) = %v, want %v", test.low, test.high, got, test.want)
+			}
+		})
+	}
+}
+
+// TestFileTimeRoundTrip pins the two helpers against each other at the
+// precision a FILETIME actually carries, which is 100 nanoseconds. This is
+// where remoteInfoTime is covered too: cgo types cannot be named in a test
+// file, and remoteInfoTime only null-checks the pointer and forwards the two
+// halves of LastWriteTime to timeFromFileTime.
+func TestFileTimeRoundTrip(t *testing.T) {
+	for _, want := range []time.Time{
+		time.Unix(0, 0),
+		time.Unix(1700000000, 0),
+		time.Unix(1700000000, 123456700),
+		time.Date(2261, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		low, high := fileTime(want)
+		if got := timeFromFileTime(low, high); !got.Equal(want) {
+			t.Errorf("round trip of %v gave %v", want.UTC(), got.UTC())
+		}
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/example/wfxs3/internal/config"
+	"github.com/example/wfxs3/internal/mimetype"
 	pathutil "github.com/example/wfxs3/internal/path"
 	"github.com/example/wfxs3/internal/s3store"
 )
@@ -267,14 +268,17 @@ func (s *Service) FindClose(token uint64) {
 	s.mu.Unlock()
 }
 
-func (s *Service) GetFile(remote, local string, flags int) (int, error) {
+// GetFile downloads an object. remoteModTime is the time stamp Total Commander
+// read from the listing and handed back in RemoteInfoStruct; it is the last
+// resort for stamping the local file, behind anything the object itself says.
+func (s *Service) GetFile(remote, local string, flags int, remoteModTime time.Time) (int, error) {
 	start := time.Now()
-	status, err := s.getFile(remote, local, flags)
+	status, err := s.getFile(remote, local, flags, remoteModTime)
 	s.recordTransfer("get", remote, local, flags, start, status, err)
 	return status, err
 }
 
-func (s *Service) getFile(remote, local string, flags int) (int, error) {
+func (s *Service) getFile(remote, local string, flags int, remoteModTime time.Time) (int, error) {
 	if flags&CopyResume != 0 {
 		return FileNotSupported, nil
 	}
@@ -313,6 +317,12 @@ func (s *Service) getFile(remote, local string, flags int) (int, error) {
 	}
 	var done, total atomic.Int64
 	writer := &countingWriter{writer: temp, done: &done}
+	// The time stamps the object carries, for stamping the file below.
+	// runTransfer always waits for its work to return, so reading these once it
+	// has returned needs no synchronisation. Do not read them from a progress
+	// callback, which runs while the work is still going. Keep the times rather
+	// than the whole Object, whose Body the closure has already closed.
+	var objectModTime, objectLastModified time.Time
 	err = runTransfer(progress, &done, &total, func(ctx context.Context) error {
 		object, err := s.backend.Download(ctx, profile, key)
 		if err != nil {
@@ -322,6 +332,7 @@ func (s *Service) getFile(remote, local string, flags int) (int, error) {
 			return errors.New("the response has no body")
 		}
 		defer object.Body.Close()
+		objectModTime, objectLastModified = object.ModTime, object.LastModified
 		total.Store(object.Size)
 		_, err = io.CopyBuffer(writer, object.Body, make([]byte, 1024*1024))
 		return err
@@ -342,6 +353,34 @@ func (s *Service) getFile(remote, local string, flags int) (int, error) {
 	progress.total = total.Load()
 	if progress.finish() {
 		return FileUserAbort, ErrUserAbort
+	}
+
+	// Stamp the temp file before the rename, while it is still private to this
+	// call: no other process holds the final name, there is no read-only
+	// attribute to clear, and the destination never exists with the wrong time.
+	// This has to come after the temp.Close above, because closing the last
+	// handle is itself what sets the write time on Windows. A rename within a
+	// volume preserves file times, and the temp file is created in the
+	// destination directory precisely so the rename stays within one.
+	//
+	// Stamping is best effort: the payload is already complete and correct, so
+	// failing the transfer over its time stamp would make Total Commander
+	// report a failed copy and abandon the rest of a queue. It can also fail
+	// for reasons outside the plugin, since Chtimes opens the file without
+	// sharing reads and a virus scanner holding it is enough.
+	stamp := firstUsableTime(
+		modTimeCandidate{"x-amz-meta-mtime", objectModTime},
+		modTimeCandidate{"last-modified", objectLastModified},
+		modTimeCandidate{"remote info", remoteModTime},
+	)
+	if !stamp.value.IsZero() {
+		stampStart := time.Now()
+		if err := setFileTime(tempName, time.Time{}, stamp.value); err != nil {
+			// Recorded rather than reported: ReportError raises a message box,
+			// and a queue of files would raise one per file. The activity log
+			// is where someone looks to find out why a time stamp is wrong.
+			s.record("mtime", local, "from "+stamp.source, stampStart, resultStatus(err), err)
+		}
 	}
 
 	if err := replaceFile(tempName, local); err != nil {
@@ -409,7 +448,16 @@ func (s *Service) putFile(local, remote string, flags int) (int, error) {
 	total.Store(info.Size())
 	reader := &countingReader{reader: file, done: &done}
 	err = runTransfer(progress, &done, &total, func(ctx context.Context) error {
-		return s.backend.Upload(ctx, profile, key, reader, info.Size())
+		// The Content-Type comes from the remote key, since that is what an
+		// HTTP client will fetch. It is empty for an extension nothing
+		// recognises, and the SDK then sends application/octet-stream, which
+		// is what such an object would have had anyway.
+		return s.backend.Upload(ctx, profile, key, s3store.UploadInput{
+			Body:        reader,
+			Size:        info.Size(),
+			ContentType: mimetype.ForPath(key),
+			ModTime:     info.ModTime(),
+		})
 	})
 	if err != nil {
 		if errors.Is(err, ErrUserAbort) {

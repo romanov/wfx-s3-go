@@ -92,12 +92,41 @@ shows each HTTP status, request ID, and error. **Open wfxs3.ini** opens the
 settings file in its associated editor, and **Copy all** copies the report
 to the clipboard, for example to attach it to a bug report.
 
+## Time stamps and Content-Type
+
+Uploads set the object's `Content-Type` from the file extension, so objects
+served straight out of the bucket over HTTP arrive as the right type instead
+of `application/octet-stream`. Extensions the plugin does not recognise are
+left alone and keep the S3 default.
+
+Uploads also store the local file's modification time as the object's
+`x-amz-meta-mtime`, written as Unix seconds with a fraction, the same
+convention rclone uses. Downloads stamp the local file with the first time
+stamp they can use: `x-amz-meta-mtime`, then the object's own `LastModified`,
+then whatever Total Commander read from the listing. Values written by s3fs
+and RFC 3339 time stamps are read too. A file copied out and back therefore
+keeps its original time, which is what makes the plugin usable for backups.
+
+Two consequences worth knowing:
+
+- Directory listings show S3's own `LastModified`, not `x-amz-meta-mtime`,
+  because a bucket listing does not return user metadata and fetching it per
+  entry would mean one extra request per file. A downloaded file can
+  therefore end up with an older time stamp than the panel showed.
+- Uploading replaces an object outright, including its `Content-Type` and any
+  user metadata another tool had set on it.
+
+Setting the time stamp is best effort: if it fails, the download still
+succeeds and the reason is recorded in the debug dialog.
+
 ## Current limitations
 
 - x64 only; there is no 32-bit build.
 - Foreground transfers only.
 - No resume or multipart upload support.
 - Virtual folders are browse-only; mkdir and remove-directory are not exposed.
-- Rename, remote copy, attributes, and timestamps are not exposed.
+- Rename, remote copy, and attributes are not exposed, and neither is
+  setting the time stamp of an object already in the bucket. Transfers do
+  carry time stamps; see Time stamps and Content-Type above.
 - S3 object keys containing backslashes cannot be addressed through the WFX
   path syntax.

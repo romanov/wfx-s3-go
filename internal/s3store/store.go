@@ -35,9 +35,24 @@ type Entry struct {
 
 // Object is a readable S3 object body and its metadata.
 type Object struct {
-	Body         io.ReadCloser
-	Size         int64
+	Body io.ReadCloser
+	Size int64
+	// LastModified is the time stamp S3 keeps for the object itself, which
+	// is when it was uploaded rather than when its contents were written.
 	LastModified time.Time
+	// ModTime is the source file time stamp from x-amz-meta-mtime, zero when
+	// the object carries none or carries one that cannot be read.
+	ModTime time.Time
+}
+
+// UploadInput is an object body and the metadata stored alongside it. An empty
+// ContentType and a zero ModTime are left out of the request, so the endpoint
+// applies its own defaults.
+type UploadInput struct {
+	Body        io.Reader
+	Size        int64
+	ContentType string
+	ModTime     time.Time
 }
 
 // ProbeResult describes the response to a connection probe. Either field is
@@ -54,7 +69,7 @@ type Backend interface {
 	List(context.Context, config.Profile, string) ([]Entry, error)
 	Head(context.Context, config.Profile, string) (bool, error)
 	Download(context.Context, config.Profile, string) (Object, error)
-	Upload(context.Context, config.Profile, string, io.Reader, int64) error
+	Upload(context.Context, config.Profile, string, UploadInput) error
 	Delete(context.Context, config.Profile, string) error
 	Probe(context.Context, config.Profile) (ProbeResult, error)
 }
@@ -212,16 +227,37 @@ func (s *Store) Download(ctx context.Context, profile config.Profile, key string
 	if output.LastModified != nil {
 		object.LastModified = *output.LastModified
 	}
+	// The SDK strips the x-amz-meta- prefix and lowercases what is left, so a
+	// header written as x-amz-meta-mtime arrives under this key. A value that
+	// will not parse is treated as absent rather than as an error: the object
+	// itself is fine and its own time stamp still stands.
+	if modTime, ok := parseModTime(output.Metadata[metadataModTimeKey]); ok {
+		object.ModTime = modTime
+	}
 	return object, nil
 }
 
-func (s *Store) Upload(ctx context.Context, profile config.Profile, key string, body io.Reader, size int64) error {
-	_, err := s.client(profile).PutObject(ctx, &s3.PutObjectInput{
+// Upload stores an object. PutObject replaces an existing object wholesale, so
+// a re-upload also replaces whatever Content-Type and user metadata the object
+// carried before.
+func (s *Store) Upload(ctx context.Context, profile config.Profile, key string, input UploadInput) error {
+	request := &s3.PutObjectInput{
 		Bucket:        aws.String(profile.Bucket),
 		Key:           aws.String(path.ObjectKey(profile, key)),
-		Body:          body,
-		ContentLength: aws.Int64(size),
-	})
+		Body:          input.Body,
+		ContentLength: aws.Int64(input.Size),
+	}
+	// Leave either out when there is nothing to say. An absent ContentType is
+	// not the same as an empty one: the SDK fills the header in with
+	// application/octet-stream, which is the status quo for an extension
+	// nothing recognises and better than guessing.
+	if input.ContentType != "" {
+		request.ContentType = aws.String(input.ContentType)
+	}
+	if !input.ModTime.IsZero() {
+		request.Metadata = map[string]string{metadataModTimeKey: formatModTime(input.ModTime)}
+	}
+	_, err := s.client(profile).PutObject(ctx, request)
 	return err
 }
 

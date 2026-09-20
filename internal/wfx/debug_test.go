@@ -40,10 +40,10 @@ func TestOperationsAreRecorded(t *testing.T) {
 	// is worth an entry.
 	_ = findNames(t, service, `\demo`)
 	_ = findNames(t, service, `\demo`)
-	if _, err := service.GetFile(`\demo\a.txt`, filepath.Join(dir, "a.txt"), CopyOverwrite); err != nil {
+	if _, err := service.GetFile(`\demo\a.txt`, filepath.Join(dir, "a.txt"), CopyOverwrite, time.Time{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.GetFile(`\demo\missing.txt`, filepath.Join(dir, "missing.txt"), 0); err == nil {
+	if _, err := service.GetFile(`\demo\missing.txt`, filepath.Join(dir, "missing.txt"), 0, time.Time{}); err == nil {
 		t.Fatal("expected the missing object to fail")
 	}
 	if _, err := service.DeleteFile(`\demo\a.txt`); err != nil {

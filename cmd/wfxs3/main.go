@@ -205,8 +205,8 @@ func FsFindClose(handle uintptr) C.int {
 
 //export FsGetFileW
 func FsGetFileW(remoteName *C.wchar_t, localName *C.wchar_t, copyFlags C.int, remoteInfo *C.RemoteInfoStruct) C.int {
-	_ = remoteInfo
-	status, err := service.GetFile(readWideString(remoteName), readWideString(localName), int(copyFlags))
+	status, err := service.GetFile(readWideString(remoteName), readWideString(localName),
+		int(copyFlags), remoteInfoTime(remoteInfo))
 	if err != nil && !errors.Is(err, wfx.ErrUserAbort) {
 		service.ReportError(err)
 	}
@@ -419,6 +419,39 @@ func fileTime(value time.Time) (uint32, uint32) {
 		return noFileTimeLow, noFileTimeHigh
 	}
 	return splitUint64(uint64(intervals))
+}
+
+// timeFromFileTime is the inverse of fileTime. The no time stamp sentinel, a
+// zero FILETIME, and anything that would predate the Windows epoch all mean the
+// entry has no time stamp and give back the zero Time.
+func timeFromFileTime(low, high uint32) time.Time {
+	// fillFindData writes this sentinel for every entry without a time stamp,
+	// and Total Commander hands it straight back in RemoteInfoStruct.
+	if low == noFileTimeLow && high == noFileTimeHigh {
+		return time.Time{}
+	}
+	intervals := int64(uint64(high)<<32 | uint64(low))
+	if intervals <= 0 {
+		return time.Time{}
+	}
+	const windowsEpochOffset = int64(11644473600)
+	const intervalsPerSecond = int64(10000000)
+	return time.Unix(
+		intervals/intervalsPerSecond-windowsEpochOffset,
+		intervals%intervalsPerSecond*100,
+	)
+}
+
+// remoteInfoTime reads the remote time stamp Total Commander passes to
+// FsGetFileW. The pointer may be null.
+func remoteInfoTime(info *C.RemoteInfoStruct) time.Time {
+	if info == nil {
+		return time.Time{}
+	}
+	return timeFromFileTime(
+		uint32(info.LastWriteTime.dwLowDateTime),
+		uint32(info.LastWriteTime.dwHighDateTime),
+	)
 }
 
 func setLastError(code uint32) {

@@ -28,15 +28,26 @@ type fakeBackend struct {
 	uploads     map[string][]byte
 	downloadErr error
 
+	// uploadInputs keeps everything but the body of the last upload of each
+	// object, so tests can check the metadata that went with it.
+	uploadInputs map[string]s3store.UploadInput
+	// The time stamps Download reports. newFakeBackend gives LastModified a
+	// value because every real object has one; ModTime starts zero because
+	// only objects uploaded by an mtime-aware client carry it.
+	downloadLastModified time.Time
+	downloadModTime      time.Time
+
 	probeErrs    map[string]error // by profile name
 	probeRelease chan struct{}    // when set, Probe waits until it is closed
 }
 
 func newFakeBackend() *fakeBackend {
 	return &fakeBackend{
-		entries: make(map[string][]s3store.Entry),
-		objects: make(map[string][]byte),
-		uploads: make(map[string][]byte),
+		entries:              make(map[string][]s3store.Entry),
+		objects:              make(map[string][]byte),
+		uploads:              make(map[string][]byte),
+		uploadInputs:         make(map[string]s3store.UploadInput),
+		downloadLastModified: time.Unix(1700000000, 0),
 	}
 }
 
@@ -61,16 +72,23 @@ func (f *fakeBackend) Download(_ context.Context, profile config.Profile, key st
 	if !ok {
 		return s3store.Object{}, os.ErrNotExist
 	}
-	return s3store.Object{Body: io.NopCloser(bytes.NewReader(data)), Size: int64(len(data)), LastModified: time.Unix(1700000000, 0)}, nil
+	return s3store.Object{
+		Body:         io.NopCloser(bytes.NewReader(data)),
+		Size:         int64(len(data)),
+		LastModified: f.downloadLastModified,
+		ModTime:      f.downloadModTime,
+	}, nil
 }
 
-func (f *fakeBackend) Upload(_ context.Context, profile config.Profile, key string, body io.Reader, _ int64) error {
-	data, err := io.ReadAll(body)
+func (f *fakeBackend) Upload(_ context.Context, profile config.Profile, key string, input s3store.UploadInput) error {
+	data, err := io.ReadAll(input.Body)
 	if err != nil {
 		return err
 	}
 	f.uploads[objectID(profile, key)] = data
 	f.objects[objectID(profile, key)] = data
+	input.Body = nil // consumed above; the body is in f.uploads
+	f.uploadInputs[objectID(profile, key)] = input
 	return nil
 }
 
@@ -274,7 +292,7 @@ func TestGetFileSupportsOverwriteAndMove(t *testing.T) {
 		t.Fatal(err)
 	}
 	local := filepath.Join(t.TempDir(), "hello.txt")
-	status, err := service.GetFile(`\demo\hello.txt`, local, CopyMove)
+	status, err := service.GetFile(`\demo\hello.txt`, local, CopyMove, time.Time{})
 	if err != nil || status != FileOK {
 		t.Fatalf("download failed: %d %v", status, err)
 	}
@@ -344,6 +362,7 @@ func TestPutFileReportsCompletionForEmptyFile(t *testing.T) {
 func TestPutFileUploadsThroughPlainHTTPEndpoint(t *testing.T) {
 	payload := []byte(strings.Repeat("s3 over plain http\n", 512))
 	var uploaded []byte
+	var putHeader http.Header
 	puts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
 		switch request.Method {
@@ -351,6 +370,7 @@ func TestPutFileUploadsThroughPlainHTTPEndpoint(t *testing.T) {
 			response.WriteHeader(http.StatusNotFound)
 		case http.MethodPut:
 			puts++
+			putHeader = request.Header.Clone()
 			body, err := io.ReadAll(request.Body)
 			if err != nil {
 				http.Error(response, err.Error(), http.StatusInternalServerError)
@@ -388,6 +408,15 @@ func TestPutFileUploadsThroughPlainHTTPEndpoint(t *testing.T) {
 	}
 	if puts != 1 {
 		t.Fatalf("expected exactly one PutObject request, got %d", puts)
+	}
+	// The headers the real SDK put on the wire, rather than what the fake
+	// backend was handed. The test server does not check the signature, so this
+	// shows the request was built and sent, not that it was signed correctly.
+	if got, want := putHeader.Get("Content-Type"), "text/plain; charset=utf-8"; got != want {
+		t.Errorf("Content-Type = %q, want %q", got, want)
+	}
+	if putHeader.Get("X-Amz-Meta-Mtime") == "" {
+		t.Error("X-Amz-Meta-Mtime was not sent")
 	}
 	if len(percents) == 0 || percents[len(percents)-1] != 100 {
 		t.Fatalf("expected a 100%% completion callback, got %v", percents)
@@ -491,7 +520,7 @@ func TestGetFileStallFailsAfterIdleTimeout(t *testing.T) {
 	local := filepath.Join(dir, "stalled.bin")
 
 	start := time.Now()
-	status, err := service.GetFile(`\demo\stalled.bin`, local, 0)
+	status, err := service.GetFile(`\demo\stalled.bin`, local, 0, time.Time{})
 	if status != FileReadError || !errors.Is(err, ErrTransferStalled) {
 		t.Fatalf("expected a stalled download, got %d %v", status, err)
 	}
@@ -525,7 +554,7 @@ func TestGetFileCancelDuringStall(t *testing.T) {
 		return cancelledAt.Load() != 0 // the user has clicked Cancel
 	}})
 
-	status, err := service.GetFile(`\demo\stalled.bin`, filepath.Join(dir, "stalled.bin"), 0)
+	status, err := service.GetFile(`\demo\stalled.bin`, filepath.Join(dir, "stalled.bin"), 0, time.Time{})
 	if status != FileUserAbort || !errors.Is(err, ErrUserAbort) {
 		t.Fatalf("expected a user abort, got %d %v", status, err)
 	}
@@ -645,7 +674,7 @@ func TestGetFileOverwrite(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			status, err := service.GetFile(`\demo\hello.txt`, local, test.flags)
+			status, err := service.GetFile(`\demo\hello.txt`, local, test.flags, time.Time{})
 			if err != nil || status != test.status {
 				t.Fatalf("unexpected result: %d %v", status, err)
 			}
@@ -674,9 +703,178 @@ func TestGetFileMapsDownloadErrors(t *testing.T) {
 			service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
 			writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
 
-			status, err := service.GetFile(`\demo\file.txt`, filepath.Join(dir, "file.txt"), 0)
+			status, err := service.GetFile(`\demo\file.txt`, filepath.Join(dir, "file.txt"), 0, time.Time{})
 			if status != test.status || !errors.Is(err, test.err) {
 				t.Fatalf("got %d %v, want status %d", status, err, test.status)
+			}
+		})
+	}
+}
+
+// TestGetFileStampsDownloadedFile covers the priority chain: the source time
+// stamp the object carries beats the object's own, which beats what Total
+// Commander read from the listing.
+func TestGetFileStampsDownloadedFile(t *testing.T) {
+	var (
+		// Whole milliseconds, so the value survives NTFS, ext4 and APFS alike.
+		metaTime   = time.Unix(1500000000, 500000000)
+		objectTime = time.Unix(1600000000, 250000000)
+		listedTime = time.Unix(1400000000, 750000000)
+		// Chtimes converts through time.UnixNano and cannot carry this.
+		unrepresentable = time.Date(3000, 1, 1, 0, 0, 0, 0, time.UTC)
+	)
+	tests := []struct {
+		name         string
+		modTime      time.Time
+		lastModified time.Time
+		remote       time.Time
+		want         time.Time
+	}{
+		{"source time stamp wins", metaTime, objectTime, listedTime, metaTime},
+		{"falls back to the object time stamp", time.Time{}, objectTime, listedTime, objectTime},
+		{"falls back to what Total Commander passed", time.Time{}, time.Time{}, listedTime, listedTime},
+		// An unusable candidate is skipped rather than ending the search, so a
+		// nonsense source time stamp does not cost the file a good one.
+		{"skips an unrepresentable candidate", unrepresentable, objectTime, listedTime, objectTime},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			backend.objects[objectID(config.Profile{Name: "demo"}, "hello.txt")] = []byte("hello")
+			backend.downloadModTime = test.modTime
+			backend.downloadLastModified = test.lastModified
+			dir := t.TempDir()
+			service := New(backend)
+			service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+			writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+			local := filepath.Join(dir, "hello.txt")
+
+			status, err := service.GetFile(`\demo\hello.txt`, local, 0, test.remote)
+			if err != nil || status != FileOK {
+				t.Fatalf("unexpected result: %d %v", status, err)
+			}
+			info, err := os.Stat(local)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.ModTime().Equal(test.want) {
+				t.Errorf("local time stamp = %v, want %v", info.ModTime().UTC(), test.want.UTC())
+			}
+		})
+	}
+}
+
+func TestGetFileLeavesTimeStampAloneWhenNoneIsKnown(t *testing.T) {
+	backend := newFakeBackend()
+	backend.objects[objectID(config.Profile{Name: "demo"}, "hello.txt")] = []byte("hello")
+	backend.downloadLastModified = time.Time{}
+	dir := t.TempDir()
+	service := New(backend)
+	service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+	local := filepath.Join(dir, "hello.txt")
+
+	before := time.Now()
+	status, err := service.GetFile(`\demo\hello.txt`, local, 0, time.Time{})
+	if err != nil || status != FileOK {
+		t.Fatalf("unexpected result: %d %v", status, err)
+	}
+	info, err := os.Stat(local)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nothing to stamp with, so the file keeps the time it was written.
+	if info.ModTime().Before(before.Add(-time.Minute)) {
+		t.Errorf("local time stamp = %v, want roughly now", info.ModTime())
+	}
+}
+
+// TestGetFileSurvivesTimeStampFailure pins the best-effort policy: a complete
+// and correct download is not reported as a failure because its time stamp
+// could not be set.
+func TestGetFileSurvivesTimeStampFailure(t *testing.T) {
+	original := setFileTime
+	setFileTime = func(string, time.Time, time.Time) error { return errors.New("denied") }
+	t.Cleanup(func() { setFileTime = original })
+
+	backend := newFakeBackend()
+	backend.objects[objectID(config.Profile{Name: "demo"}, "hello.txt")] = []byte("hello")
+	dir := t.TempDir()
+	service := New(backend)
+	service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+	writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+	local := filepath.Join(dir, "hello.txt")
+
+	status, err := service.GetFile(`\demo\hello.txt`, local, 0, time.Time{})
+	if err != nil || status != FileOK {
+		t.Fatalf("unexpected result: %d %v", status, err)
+	}
+	if data, err := os.ReadFile(local); err != nil || string(data) != "hello" {
+		t.Fatalf("local file holds %q (%v), want %q", data, err, "hello")
+	}
+	// The temp file still has to be cleaned up by the rename.
+	matches, err := filepath.Glob(filepath.Join(dir, ".wfxs3-download-*"))
+	if err != nil || len(matches) != 0 {
+		t.Fatalf("temp files left behind: %v (%v)", matches, err)
+	}
+	// Silent would be wrong: the activity log is where someone looks to find
+	// out why the time stamp is not what they expected.
+	var recorded *Activity
+	for _, entry := range service.activity.newestFirst() {
+		if entry.Op == "mtime" {
+			recorded = &entry
+			break
+		}
+	}
+	if recorded == nil {
+		t.Fatal("the failed time stamp was not recorded")
+	}
+	if recorded.Status != "error" || !strings.Contains(recorded.Err, "denied") || recorded.Path != local {
+		t.Errorf("unexpected mtime entry: %+v", *recorded)
+	}
+}
+
+func TestPutFileSendsContentTypeAndModTime(t *testing.T) {
+	tests := []struct {
+		name        string
+		file        string
+		key         string
+		contentType string
+	}{
+		{"known extension", "site.css", `\demo\site.css`, "text/css; charset=utf-8"},
+		// Nothing recognises this, so the plugin says nothing and the SDK's own
+		// application/octet-stream default stands.
+		{"unknown extension", "blob.unknownextension", `\demo\blob.unknownextension`, ""},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			backend := newFakeBackend()
+			dir := t.TempDir()
+			service := New(backend)
+			service.SetDefaultIniName(filepath.Join(dir, "wincmd.ini"))
+			writeServiceConfig(t, service, profileConfig("demo", "https://s3.example.test"))
+			local := filepath.Join(dir, test.file)
+			if err := os.WriteFile(local, []byte("body"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			modTime := time.Unix(1500000000, 500000000)
+			if err := os.Chtimes(local, modTime, modTime); err != nil {
+				t.Fatal(err)
+			}
+
+			status, err := service.PutFile(local, test.key, 0)
+			if err != nil || status != FileOK {
+				t.Fatalf("upload failed: %d %v", status, err)
+			}
+			input, ok := backend.uploadInputs[objectID(config.Profile{Name: "demo"}, strings.TrimPrefix(test.key, `\demo\`))]
+			if !ok {
+				t.Fatalf("no upload recorded: %v", backend.uploadInputs)
+			}
+			if input.ContentType != test.contentType {
+				t.Errorf("ContentType = %q, want %q", input.ContentType, test.contentType)
+			}
+			if !input.ModTime.Equal(modTime) {
+				t.Errorf("ModTime = %v, want %v", input.ModTime.UTC(), modTime.UTC())
 			}
 		})
 	}
