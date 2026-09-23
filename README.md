@@ -121,7 +121,7 @@ succeeds and the reason is recorded in the debug dialog.
 
 ## Current limitations
 
-- x64 only; there is no 32-bit build.
+- x64 only; there is no 32-bit build. (use https://github.com/k0zmo/s3cmd for x86)
 - Foreground transfers only.
 - No resume or multipart upload support.
 - Virtual folders are browse-only; mkdir and remove-directory are not exposed.
@@ -130,3 +130,4 @@ succeeds and the reason is recorded in the debug dialog.
   carry time stamps; see Time stamps and Content-Type above.
 - S3 object keys containing backslashes cannot be addressed through the WFX
   path syntax.
+
