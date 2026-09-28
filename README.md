@@ -3,13 +3,17 @@
 <img width="650" height="325" alt="653090478-05c930c4-32f1-43f9-b83c-0093c59455b8(1)" src="https://github.com/user-attachments/assets/aedca9ba-1624-4fa1-bb86-946f9a9eff8c" />
 
 
-This is an x64-only Total Commander file-system plugin written in Go. It
+This is an x64-only Total Commander | Double Commander file-system plugin written in Go. It
 exposes S3-compatible buckets as virtual folders and supports browsing,
 uploading, downloading, and deleting objects.
 
 The repository includes the Total Commander WFX SDK under
 `WFX-SDK-master`. The plugin is built as a Unicode Windows x64 c-shared DLL
 with the required `.wfx64` extension.
+
+## Release tested
+- [x] Total Commander 11.58 x64
+- [x] Double Commander 1.2.9 x64
 
 ## Requirements
 
