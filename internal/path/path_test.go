@@ -7,12 +7,44 @@ import (
 )
 
 func TestParseRemote(t *testing.T) {
-	profile, relative, err := ParseRemote(`\demo\one\two.txt`)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name         string
+		remote       string
+		wantProfile  string
+		wantRelative string
+	}{
+		{name: "empty root", remote: ""},
+		{name: "windows root", remote: `\`},
+		{name: "unix root", remote: `/`},
+		{name: "windows nested", remote: `\demo\one\two.txt`, wantProfile: "demo", wantRelative: "one/two.txt"},
+		{name: "unix profile", remote: `/demo`, wantProfile: "demo"},
+		{name: "unix nested", remote: `/demo/one/two.txt`, wantProfile: "demo", wantRelative: "one/two.txt"},
 	}
-	if profile != "demo" || relative != "one/two.txt" {
-		t.Fatalf("got %q %q", profile, relative)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			profile, relative, err := ParseRemote(test.remote)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if profile != test.wantProfile || relative != test.wantRelative {
+				t.Fatalf("got %q %q, want %q %q", profile, relative, test.wantProfile, test.wantRelative)
+			}
+		})
+	}
+}
+
+func TestParseRemoteRejectsInvalidPath(t *testing.T) {
+	tests := []string{
+		`demo\one.txt`,
+		`/demo\one.txt`,
+		`\demo/one.txt`,
+	}
+	for _, remote := range tests {
+		t.Run(remote, func(t *testing.T) {
+			if _, _, err := ParseRemote(remote); err == nil {
+				t.Fatal("ParseRemote succeeded, want an error")
+			}
+		})
 	}
 }
 

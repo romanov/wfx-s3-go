@@ -10,13 +10,22 @@ import (
 // ParseRemote splits a WFX path into its profile name and slash-separated
 // object path relative to that profile's configured prefix.
 func ParseRemote(remote string) (profile string, relative string, err error) {
-	if remote == "\\" || remote == "" {
+	if remote == "\\" || remote == "/" || remote == "" {
 		return "", "", nil
 	}
-	if !strings.HasPrefix(remote, "\\") {
-		return "", "", fmt.Errorf("remote path must start with a backslash")
+	separator := remote[:1]
+	if separator != "\\" && separator != "/" {
+		return "", "", fmt.Errorf("remote path must start with a slash or backslash")
 	}
-	parts := strings.Split(strings.TrimPrefix(remote, "\\"), "\\")
+	otherSeparator := "\\"
+	if separator == "\\" {
+		otherSeparator = "/"
+	}
+	remote = strings.TrimPrefix(remote, separator)
+	if strings.Contains(remote, otherSeparator) {
+		return "", "", fmt.Errorf("remote path cannot mix slash and backslash separators")
+	}
+	parts := strings.Split(remote, separator)
 	if len(parts) == 0 || parts[0] == "" {
 		return "", "", fmt.Errorf("remote path does not contain a profile")
 	}
