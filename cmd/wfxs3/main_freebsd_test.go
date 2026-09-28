@@ -1,0 +1,83 @@
+//go:build freebsd && cgo
+
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+func TestDecodeUTF8NUL(t *testing.T) {
+	if got := decodeUTF8NUL(append([]byte("/home/user/.config/doublecmd/doublecmd.xml"), 0, 'x')); got != "/home/user/.config/doublecmd/doublecmd.xml" {
+		t.Fatalf("decodeUTF8NUL = %q", got)
+	}
+}
+
+func TestClassifyVerb(t *testing.T) {
+	tests := map[string]verbKind{
+		"open":        verbOpen,
+		"OPEN":        verbOpen,
+		"properties":  verbProperties,
+		"Properties":  verbProperties,
+		"quote debug": verbOther,
+		"chmod 755":   verbOther,
+		"":            verbOther,
+	}
+	for verb, want := range tests {
+		if got := classifyVerb(verb); got != want {
+			t.Errorf("classifyVerb(%q) = %d, want %d", verb, got, want)
+		}
+	}
+}
+
+func TestInterfaceVersion(t *testing.T) {
+	if got := interfaceVersion(1, 30); got != "1.30" {
+		t.Fatalf("interfaceVersion(1, 30) = %q, want 1.30", got)
+	}
+	if got := interfaceVersion(2, 5); got != "2.05" {
+		t.Fatalf("interfaceVersion(2, 5) = %q, want 2.05", got)
+	}
+}
+
+func TestFileTime(t *testing.T) {
+	if low, high := fileTime(time.Time{}); low != noFileTimeLow || high != noFileTimeHigh {
+		t.Fatalf("zero time = %#x/%#x, want the WFX no-time value", low, high)
+	}
+	if low, high := fileTime(time.Unix(0, 0)); low != 0xD53E8000 || high != 0x019DB1DE {
+		t.Fatalf("Unix epoch = %#x/%#x, want 0xd53e8000/0x19db1de", low, high)
+	}
+}
+
+func TestTimeFromFileTime(t *testing.T) {
+	tests := []struct {
+		name string
+		low  uint32
+		high uint32
+		want time.Time
+	}{
+		{"the no-time sentinel", noFileTimeLow, noFileTimeHigh, time.Time{}},
+		{"a zero FILETIME", 0, 0, time.Time{}},
+		{"the Unix epoch", 0xD53E8000, 0x019DB1DE, time.Unix(0, 0)},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := timeFromFileTime(test.low, test.high); !got.Equal(test.want) {
+				t.Errorf("timeFromFileTime(%#x, %#x) = %v, want %v", test.low, test.high, got, test.want)
+			}
+		})
+	}
+}
+
+func TestFileTimeRoundTrip(t *testing.T) {
+	for _, want := range []time.Time{
+		time.Unix(0, 0),
+		time.Unix(1700000000, 0),
+		time.Unix(1700000000, 123456700),
+		time.Date(2261, 1, 1, 0, 0, 0, 0, time.UTC),
+	} {
+		low, high := fileTime(want)
+		if got := timeFromFileTime(low, high); !got.Equal(want) {
+			t.Errorf("round trip of %v gave %v", want.UTC(), got.UTC())
+		}
+	}
+}

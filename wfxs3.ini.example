@@ -1,5 +1,8 @@
-; Copy this file to the directory containing Total Commander's wincmd.ini
-; and rename it to wfxs3.ini.
+; Copy this file to the directory containing the file manager's main settings
+; file and rename it to wfxs3.ini.
+;
+; Windows Total Commander: directory containing wincmd.ini.
+; FreeBSD Double Commander: usually the Double Commander config directory.
 ;
 ; Credentials are intentionally plaintext in this MVP. Protect this file.
 

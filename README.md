@@ -3,27 +3,33 @@
 <img width="650" height="325" alt="653090478-05c930c4-32f1-43f9-b83c-0093c59455b8(1)" src="https://github.com/user-attachments/assets/aedca9ba-1624-4fa1-bb86-946f9a9eff8c" />
 
 
-This is an x64-only Total Commander | Double Commander file-system plugin written in Go. It
-exposes S3-compatible buckets as virtual folders and supports browsing,
+This is an x64 Total Commander | Double Commander file-system plugin written in
+Go. It exposes S3-compatible buckets as virtual folders and supports browsing,
 uploading, downloading, and deleting objects.
 
 The repository includes the Total Commander WFX SDK under
 `WFX-SDK-master`. The plugin is built as a Unicode Windows x64 c-shared DLL
-with the required `.wfx64` extension.
+with the required `.wfx64` extension. On FreeBSD x64 it builds as a native
+Double Commander WFX shared library with the `.wfx` extension.
 
 ## Release tested
 - [x] Total Commander 11.58 x64
 - [x] Double Commander 1.2.9 x64
 
+## Build tested
+- [x] FreeBSD x64 native WFX shared library
+
 ## Requirements
 
-- Total Commander x64.
+- Total Commander x64 on Windows, or Double Commander x64 on FreeBSD.
 - Go 1.24 or newer.
-- A Windows x64 cgo compiler, such as MinGW-w64 GCC.
+- A cgo compiler for the target platform:
+  - Windows: a Windows x64 MinGW-w64 GCC.
+  - FreeBSD: the system C compiler.
 
 The current AWS SDK for Go v2 also requires Go 1.24 or newer.
 
-## Build
+## Build on Windows
 
 Open PowerShell in the repository root and run:
 
@@ -33,10 +39,22 @@ Open PowerShell in the repository root and run:
 
 The plugin is written to `dist\wfxs3.wfx64`.
 
+## Build on FreeBSD
+
+Open a shell in the repository root and run:
+
+```sh
+./build-freebsd.sh
+```
+
+The plugin is written to `dist/freebsd-amd64/wfxs3.wfx`.
+
 ## Configure
 
-Copy `wfxs3.ini.example` to the directory containing Total Commander's
-`wincmd.ini`, rename it to `wfxs3.ini`, and add one INI section per profile:
+Copy `wfxs3.ini.example` to the directory containing the file manager's main
+settings file, rename it to `wfxs3.ini`, and add one INI section per profile.
+On Windows this is the directory containing Total Commander's `wincmd.ini`; on
+FreeBSD this is normally Double Commander's config directory.
 
 ```ini
 [my-server]
@@ -71,18 +89,27 @@ password callback was deliberately not enabled. Restrict access to
 `wfxs3.ini` and use a later version with encrypted credential storage for
 shared or untrusted machines.
 
-## Install
+## Install on Windows
 
 1. Build the plugin.
 2. In Total Commander, open Configuration → Options → Plugins → FS Plugins.
 3. Click Add and select `dist\wfxs3.wfx64`.
 4. Open Network Neighborhood and enter the `S3 API Endpoints` plugin root.
 
+## Install on FreeBSD
+
+1. Build the plugin.
+2. In Double Commander, open Configuration → Options → Plugins → WFX.
+3. Click Add and select `dist/freebsd-amd64/wfxs3.wfx`.
+4. Open the VFS list and enter the `S3 API Endpoints` plugin root.
+
 ## Debug information
 
 Press Alt+Enter (or right-click and choose Properties) on `S3 API Endpoints` in
 Network Neighborhood, or on any profile, folder, or object inside it, to
-open the debug dialog. It shows:
+open debug information. On Windows this is shown in a dialog. On FreeBSD the
+same report is shown through Double Commander's plugin message/log callback.
+It shows:
 
 - the plugin build, the Total Commander version, and the settings file
   with its load status or last error;
@@ -126,6 +153,8 @@ succeeds and the reason is recorded in the debug dialog.
 ## Current limitations
 
 - x64 only; there is no 32-bit build. (use https://github.com/k0zmo/s3cmd for x86)
+- FreeBSD support targets native Double Commander, not Total Commander running
+  through Wine.
 - Foreground transfers only.
 - No resume or multipart upload support.
 - Virtual folders are browse-only; mkdir and remove-directory are not exposed.
@@ -134,4 +163,3 @@ succeeds and the reason is recorded in the debug dialog.
   carry time stamps; see Time stamps and Content-Type above.
 - S3 object keys containing backslashes cannot be addressed through the WFX
   path syntax.
-
