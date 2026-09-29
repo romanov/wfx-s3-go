@@ -1,7 +1,6 @@
 # WFX S3 for Total Commander | Double Commander
 
-<img width="650" height="325" alt="653090478-05c930c4-32f1-43f9-b83c-0093c59455b8(1)" src="https://github.com/user-attachments/assets/aedca9ba-1624-4fa1-bb86-946f9a9eff8c" />
-
+<img width="650" height="325" alt="logo_2" src="https://github.com/user-attachments/assets/80c94461-e361-46b7-9f6d-038c77463530" />
 
 This is an x64 Total Commander | Double Commander file-system plugin written in
 Go. It exposes S3-compatible buckets as virtual folders and supports browsing,
