@@ -11,6 +11,9 @@ The repository includes the Total Commander WFX SDK under
 with the required `.wfx64` extension. On FreeBSD x64 it builds as a native
 Double Commander WFX shared library with the `.wfx` extension.
 
+<img src="https://img.shields.io/badge/TotalCommander-Windows-blue"/> <img src="https://img.shields.io/badge/DoubleCommander-Windows-blue"/> <img src="https://img.shields.io/badge/DoubleCommander-FreeBSD-red"/>
+
+
 ## Release tested
 - [x] Total Commander 11.58 x64
 - [x] Double Commander 1.2.9 x64
